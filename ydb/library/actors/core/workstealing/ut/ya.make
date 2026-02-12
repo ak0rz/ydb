@@ -11,6 +11,7 @@ ELSE()
 ENDIF()
 
 SRCS(
+    injection_queue_ut.cpp
     local_deque_ut.cpp
 )
 
