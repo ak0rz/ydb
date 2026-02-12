@@ -131,6 +131,7 @@ END()
 RECURSE(
     harmonizer
     manual_test
+    workstealing
 )
 
 RECURSE_FOR_TESTS(
