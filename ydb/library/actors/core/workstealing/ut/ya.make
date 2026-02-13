@@ -14,6 +14,7 @@ SRCS(
     injection_queue_ut.cpp
     local_deque_ut.cpp
     topology_ut.cpp
+    ws_poll_ut.cpp
     ws_slot_ut.cpp
 )
 

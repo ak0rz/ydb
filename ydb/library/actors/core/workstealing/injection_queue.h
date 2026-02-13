@@ -118,6 +118,24 @@ namespace NActors {
             return count;
         }
 
+        // Consumer-only. Drains up to `maxItems` currently reachable items,
+        // appending their hints to `out`. Returns the number of items drained.
+        // Items beyond `maxItems` stay in the queue for the next drain call.
+        template <typename TContainer>
+        ui32 DrainAtMost(TContainer& out, ui32 maxItems) {
+            ui32 count = 0;
+            while (count < maxItems) {
+                TInjectionNode* next = Tail_->Next.load(std::memory_order_acquire);
+                if (!next) {
+                    break;
+                }
+                Tail_ = next;
+                out.push_back(next->Hint);
+                ++count;
+            }
+            return count;
+        }
+
         // Consumer-only. Approximate emptiness check.
         // May return a false negative during concurrent pushes (push in
         // progress between X1 and S1). Never returns a false positive
