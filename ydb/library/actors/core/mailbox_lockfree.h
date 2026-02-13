@@ -207,6 +207,12 @@ namespace NActors {
 
         EActorPack ActorPack = EActorPack::Empty;
 
+        // Work-stealing affinity: last pool slot that processed this mailbox.
+        // 0 = no affinity (never processed). Stored as slotIdx + 1 (1-based)
+        // so valid slot 0 is represented as 1. Fits in padding between
+        // ActorPack and ActorsInfo — sizeof(TMailbox) unchanged.
+        ui16 LastPoolSlotIdx = 0;
+
         static constexpr TMailboxType::EType Type = TMailboxType::LockFreeIntrusive;
 
         TActorsInfo ActorsInfo{ .Empty = {} };
