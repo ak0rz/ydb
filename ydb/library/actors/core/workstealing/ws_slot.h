@@ -85,6 +85,22 @@ namespace NActors::NWorkStealing {
 
         // --- Stats ---
 
+        // Check if injection queue has pending items (consumer thread only).
+        bool HasPendingInjections() const;
+
+        // --- Driver integration ---
+
+        // True when the owning worker is actively polling (not parked).
+        // Used by WakeSlot to skip redundant Unpark calls.
+        // Protocol: worker sets false (seq_cst) before parking, checks MPSC
+        // after (Dekker). WakeSlot reads (seq_cst) — if true, skips wake.
+        std::atomic<bool> WorkerSpinning{false};
+
+        // Opaque pointer for driver use (e.g., TWorker*). Eliminates hash map.
+        void* DriverData = nullptr;
+
+        // --- Stats ---
+
         TSlotStats Stats;
         TWsSlotCounters Counters;
         std::atomic<double> LoadEstimate{0.0};

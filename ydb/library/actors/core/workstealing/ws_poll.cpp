@@ -58,6 +58,10 @@ namespace NActors::NWorkStealing {
 
             stealIterator->Reset();
             while (TSlot* victim = stealIterator->Next()) {
+                // Skip empty victims — avoids CAS overhead in StealHalf
+                if (victim->SizeEstimate() == 0) {
+                    continue;
+                }
                 slot.Counters.StealAttempts.fetch_add(1, std::memory_order_relaxed);
                 size_t stolen = victim->StealHalf(stealBuf, kStealBufSize);
                 if (stolen > 0) {

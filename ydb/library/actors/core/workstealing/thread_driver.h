@@ -10,7 +10,6 @@
 
 #include <atomic>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 namespace NActors::NWorkStealing {
@@ -54,7 +53,6 @@ namespace NActors::NWorkStealing {
         TCpuTopology Topology_;
 
         std::vector<std::unique_ptr<TWorker>> Workers_;
-        std::unordered_map<TSlot*, TWorker*> SlotToWorker_; // O(1) lookup
         std::vector<TSlot*> AllSlots_; // all registered slots
 
         std::atomic<bool> Started_{false};

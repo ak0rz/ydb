@@ -76,6 +76,10 @@ namespace NActors::NWorkStealing {
         return WorkDeque_.Push(hint);
     }
 
+    bool TSlot::HasPendingInjections() const {
+        return InjectionQueue_.NonEmpty();
+    }
+
     size_t TSlot::SizeEstimate() const {
         return WorkDeque_.SizeEstimate();
     }

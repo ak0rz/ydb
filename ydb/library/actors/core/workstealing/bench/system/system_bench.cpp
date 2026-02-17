@@ -52,6 +52,10 @@ namespace {
         return result;
     }
 
+    // Global overrides (0 = use default from TWsConfig)
+    ui64 GSpinThresholdCycles = 0;
+    ui64 GMinSpinThresholdCycles = 0;
+
     // -------------------------------------------------------------------
     // Actor system setup factories
     // -------------------------------------------------------------------
@@ -99,6 +103,9 @@ namespace {
         if (spinThresholdCycles > 0) {
             wsCfg.WsConfig.SpinThresholdCycles = spinThresholdCycles;
         }
+        if (GMinSpinThresholdCycles > 0) {
+            wsCfg.WsConfig.MinSpinThresholdCycles = GMinSpinThresholdCycles;
+        }
         setup->CpuManager.WorkStealing = NActors::TWorkStealingConfig{
             .Enabled = true,
             .Pools = {wsCfg},
@@ -107,9 +114,6 @@ namespace {
         setup->Scheduler.Reset(new NActors::TBasicSchedulerThread(NActors::TSchedulerConfig()));
         return setup;
     }
-
-    // Global spin threshold override (0 = use default from TWsConfig)
-    ui64 GSpinThresholdCycles = 0;
 
     // Pool id where benchmark actors should be registered
     ui32 BenchPoolId(const TString& poolType) {
@@ -567,9 +571,15 @@ int main(int argc, const char* argv[]) {
         .DefaultValue("0")
         .StoreResult(&spinThreshold);
 
+    ui64 minSpinThreshold = 0;
+    opts.AddLongOption("min-spin-threshold", "WS min spin threshold in CPU cycles (0 = use default)")
+        .DefaultValue("0")
+        .StoreResult(&minSpinThreshold);
+
     NLastGetopt::TOptsParseResult res(&opts, argc, argv);
 
     GSpinThresholdCycles = spinThreshold;
+    GMinSpinThresholdCycles = minSpinThreshold;
 
     auto threads = ParseList(threadsList);
     auto pairs = ParseList(pairsList);

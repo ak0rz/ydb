@@ -132,7 +132,7 @@ namespace NActors::NWorkStealing {
         auto worker = std::make_unique<TWorker>();
         worker->Slot = slot;
         worker->WorkerIndex = static_cast<ui16>(Workers_.size());
-        SlotToWorker_[slot] = worker.get();
+        slot->DriverData = worker.get();
         Workers_.push_back(std::move(worker));
     }
 
@@ -141,9 +141,9 @@ namespace NActors::NWorkStealing {
         slot->TryTransition(ESlotState::Initializing, ESlotState::Active);
 
         // Wake the worker associated with this slot
-        auto it = SlotToWorker_.find(slot);
-        if (it != SlotToWorker_.end()) {
-            it->second->ParkPad.Unpark();
+        auto* worker = static_cast<TWorker*>(slot->DriverData);
+        if (worker) {
+            worker->ParkPad.Unpark();
         }
     }
 
@@ -152,10 +152,17 @@ namespace NActors::NWorkStealing {
     }
 
     void TThreadDriver::WakeSlot(TSlot* slot) {
+        // Fast path: if the worker is actively spinning, it will find the
+        // injected work on its next PollSlot iteration — skip the wake.
+        if (slot->WorkerSpinning.load(std::memory_order_seq_cst)) {
+            return;
+        }
+        // Worker is parked or about to park. Unpark it.
+        // The Dekker protocol in WorkerLoop ensures no missed wakes.
         slot->Counters.Wakes.fetch_add(1, std::memory_order_relaxed);
-        auto it = SlotToWorker_.find(slot);
-        if (it != SlotToWorker_.end()) {
-            it->second->ParkPad.Unpark();
+        auto* worker = static_cast<TWorker*>(slot->DriverData);
+        if (worker) {
+            worker->ParkPad.Unpark();
         }
     }
 
@@ -164,9 +171,9 @@ namespace NActors::NWorkStealing {
     }
 
     void TThreadDriver::SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) {
-        auto it = SlotToWorker_.find(slot);
-        if (it != SlotToWorker_.end()) {
-            it->second->Callbacks = std::move(callbacks);
+        auto* worker = static_cast<TWorker*>(slot->DriverData);
+        if (worker) {
+            worker->Callbacks = std::move(callbacks);
         }
     }
 
@@ -178,15 +185,23 @@ namespace NActors::NWorkStealing {
         auto stealIterator = MakeStealIterator(worker.Slot);
         TPollState pollState;
         ui64 lastLocalWorkTs = GetCycleCountFast();
+        // Adaptive spin: start with short threshold after wake, extend to full
+        // threshold once the slot proves it has steady local work.
+        ui64 spinThreshold = Config_.MinSpinThresholdCycles;
+
+        worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
 
         while (!worker.ShouldStop.load(std::memory_order_acquire)) {
             if (worker.Slot->GetState() != ESlotState::Active) {
                 // Slot not active yet or draining -- park
+                worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
                 worker.ParkPad.Park();
+                worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
                 if (worker.ShouldStop.load(std::memory_order_acquire)) {
                     break;
                 }
                 lastLocalWorkTs = GetCycleCountFast();
+                spinThreshold = Config_.MinSpinThresholdCycles;
                 continue;
             }
 
@@ -194,6 +209,8 @@ namespace NActors::NWorkStealing {
 
             if (pollState.HadLocalWork) {
                 lastLocalWorkTs = GetCycleCountFast();
+                // Local work found — earn full spin time
+                spinThreshold = Config_.SpinThresholdCycles;
             }
 
             // Park after spinning long enough without local work.
@@ -207,17 +224,35 @@ namespace NActors::NWorkStealing {
                 (result == EPollResult::Busy && !pollState.HadLocalWork))
             {
                 ui64 now = GetCycleCountFast();
-                if (now - lastLocalWorkTs > Config_.SpinThresholdCycles) {
+                if (now - lastLocalWorkTs > spinThreshold) {
+                    // Dekker protocol: announce intent to park, then re-check.
+                    // Paired with seq_cst load in WakeSlot. Either:
+                    //  - WakeSlot sees WorkerSpinning=false → calls Unpark
+                    //  - We see the injection → skip park
+                    worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
+
+                    if (worker.Slot->HasPendingInjections()) {
+                        // Work arrived between last poll and now — don't park
+                        worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                        lastLocalWorkTs = GetCycleCountFast();
+                        spinThreshold = Config_.MinSpinThresholdCycles;
+                        continue;
+                    }
+
                     worker.Slot->Counters.Parks.fetch_add(1, std::memory_order_relaxed);
                     worker.ParkPad.Park();
+                    worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
                     if (worker.ShouldStop.load(std::memory_order_acquire)) {
                         break;
                     }
                     pollState = TPollState{};
                     lastLocalWorkTs = GetCycleCountFast();
+                    spinThreshold = Config_.MinSpinThresholdCycles;
                 }
             }
         }
+
+        worker.Slot->WorkerSpinning.store(false, std::memory_order_release);
 
         if (worker.Callbacks.Teardown) {
             worker.Callbacks.Teardown();
