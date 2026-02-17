@@ -1,6 +1,7 @@
 #pragma once
 
 #include "defs.h"
+#include <ydb/library/actors/core/workstealing/ws_config.h>
 #include <ydb/library/actors/util/cpumask.h>
 #include <ydb/library/actors/util/datetime.h>
 #include <library/cpp/monlib/dynamic_counters/counters.h>
@@ -70,15 +71,33 @@ namespace NActors {
         TCpuMask JailAffinity;
     };
 
+    struct TWorkStealingPoolConfig {
+        ui32 PoolId = 0;
+        TString PoolName;
+        i16 MinSlotCount = 1;
+        i16 MaxSlotCount = 32;
+        i16 DefaultSlotCount = 4;
+        TDuration TimePerMailbox = TDuration::MilliSeconds(10);
+        ui32 EventsPerMailbox = 100;
+        i16 Priority = 0;
+        NWorkStealing::TWsConfig WsConfig;
+    };
+
+    struct TWorkStealingConfig {
+        bool Enabled = false;
+        TVector<TWorkStealingPoolConfig> Pools;
+    };
+
     struct TCpuManagerConfig {
         TVector<TBasicExecutorPoolConfig> Basic;
         TVector<TIOExecutorPoolConfig> IO;
         TVector<TSelfPingInfo> PingInfoByPool;
         TSharedExecutorPoolConfig Shared;
         std::optional<TExecutorPoolJailConfig> Jail;
+        std::optional<TWorkStealingConfig> WorkStealing;
 
         ui32 GetExecutorsCount() const {
-            return Basic.size() + IO.size();
+            return Basic.size() + IO.size() + (WorkStealing ? WorkStealing->Pools.size() : 0);
         }
 
         TString GetPoolName(ui32 poolId) const {
@@ -90,6 +109,13 @@ namespace NActors {
             for (const auto& p : IO) {
                 if (p.PoolId == poolId) {
                     return p.PoolName;
+                }
+            }
+            if (WorkStealing) {
+                for (const auto& p : WorkStealing->Pools) {
+                    if (p.PoolId == poolId) {
+                        return p.PoolName;
+                    }
                 }
             }
             Y_ABORT("undefined pool id: %" PRIu32, (ui32)poolId);
@@ -106,6 +132,13 @@ namespace NActors {
                     return p.Threads;
                 }
             }
+            if (WorkStealing) {
+                for (const auto& p : WorkStealing->Pools) {
+                    if (p.PoolId == poolId) {
+                        return p.DefaultSlotCount;
+                    }
+                }
+            }
             return {};
         }
 
@@ -118,15 +151,16 @@ namespace NActors {
 
     struct TSchedulerConfig {
         TSchedulerConfig(
-                ui64 resolution = 1024,
-                ui64 spinThreshold = 100,
-                ui64 progress = 10000,
-                bool useSchedulerActor = false)
+            ui64 resolution = 1024,
+            ui64 spinThreshold = 100,
+            ui64 progress = 10000,
+            bool useSchedulerActor = false)
             : ResolutionMicroseconds(resolution)
             , SpinThreshold(spinThreshold)
             , ProgressThreshold(progress)
             , UseSchedulerActor(useSchedulerActor)
-        {}
+        {
+        }
 
         ui64 ResolutionMicroseconds = 1024;
         ui64 SpinThreshold = 100;
@@ -137,7 +171,7 @@ namespace NActors {
         // For resolution >= 250000 microseconds threshold is SendPace
         // For resolution <= 250 microseconds threshold is 20 * SendPace
         ui64 RelaxedSendThresholdEventsPerSecond = RelaxedSendPaceEventsPerSecond *
-            (20 - ((20 - 1) * ClampVal(ResolutionMicroseconds, ui64(250), ui64(250000)) - 250) / (250000 - 250));
+                                                   (20 - ((20 - 1) * ClampVal(ResolutionMicroseconds, ui64(250), ui64(250000)) - 250) / (250000 - 250));
         ui64 RelaxedSendThresholdEventsPerCycle = RelaxedSendThresholdEventsPerSecond * ResolutionMicroseconds / 1000000;
 
         // Optional subsection for scheduler counters (usually subsystem=utils)
@@ -152,7 +186,8 @@ namespace NActors {
             TPoolAllocation(TPoolId poolId = 0, TPoolWeight weight = 0)
                 : PoolId(poolId)
                 , Weight(weight)
-            {}
+            {
+            }
         };
 
         TCpuId CpuId;
@@ -178,4 +213,4 @@ namespace NActors {
         }
     };
 
-}
+} // namespace NActors

@@ -11,12 +11,17 @@ namespace NActors {
     class TExecutorPoolJail;
     class TSharedExecutorPool;
 
-    class TCpuManager : public TNonCopyable {
+    namespace NWorkStealing {
+        class IDriver;
+    } // namespace NWorkStealing
+
+    class TCpuManager: public TNonCopyable {
         const ui32 ExecutorPoolCount;
         TArrayHolder<TAutoPtr<IExecutorPool>> Executors;
         std::unique_ptr<IHarmonizer> Harmonizer;
         std::unique_ptr<TSharedExecutorPool> Shared;
         std::unique_ptr<TExecutorPoolJail> Jail;
+        std::unique_ptr<NWorkStealing::IDriver> WSDriver_;
         TCpuManagerConfig Config;
 
     public:
@@ -48,8 +53,8 @@ namespace NActors {
         }
 
         void GetPoolStats(ui32 poolId, TExecutorPoolStats& poolStats, TVector<TExecutorThreadStats>& statsCopy, TVector<TExecutorThreadStats>& sharedStatsCopy) const;
-        void GetExecutorPoolState(i16 poolId, TExecutorPoolState &state) const;
-        void GetExecutorPoolStates(std::vector<TExecutorPoolState> &states) const;
+        void GetExecutorPoolState(i16 poolId, TExecutorPoolState& state) const;
+        void GetExecutorPoolStates(std::vector<TExecutorPoolState>& states) const;
 
         THarmonizerStats GetHarmonizerStats() const {
             if (Harmonizer) {
@@ -61,4 +66,4 @@ namespace NActors {
     private:
         IExecutorPool* CreateExecutorPool(ui32 poolId);
     };
-}
+} // namespace NActors

@@ -1,0 +1,51 @@
+#pragma once
+
+#include <ydb/library/actors/core/executor_thread.h>
+
+namespace NActors {
+    class TMailbox;
+} // namespace NActors
+
+namespace NActors::NWorkStealing {
+
+    // TWSExecutorContext inherits TExecutorThread but is never started as a thread.
+    //
+    // Each Driver worker holds one TWSExecutorContext per assigned pool.
+    // Worker threads call SetupTLS() at start and ClearTLS() at end.
+    // PollSlot calls ExecuteMailbox() per activation.
+    //
+    // All existing code paths work unchanged:
+    //   TActivationContext::Send() -> ExecutorThread.Send() -> ActorSystem->Send()
+    //   No virtual dispatch, no branching on the hot path.
+    class TWSExecutorContext: public TExecutorThread {
+    public:
+        // workerId: identifies this worker
+        // actorSystem: the actor system (must outlive this context)
+        // pool: the executor pool this context is associated with
+        TWSExecutorContext(
+            TWorkerId workerId,
+            TActorSystem* actorSystem,
+            IExecutorPool* pool);
+
+        // Access the thread context for TLS setup
+        TThreadContext& GetThreadCtx() {
+            return ThreadCtx;
+        }
+
+        // Initialize TLS for the current worker thread.
+        // Must be called once at thread start, before any ExecuteMailbox calls.
+        void SetupTLS();
+
+        // Clear TLS for the current worker thread.
+        // Must be called once at thread end.
+        void ClearTLS();
+
+        // Execute a mailbox. The mailbox must already be locked.
+        // Returns true if budget was depleted (mailbox still has events).
+        bool ExecuteMailbox(TMailbox* mailbox);
+
+        // Do NOT start the thread.
+        // TThread::Start() is never called.
+    };
+
+} // namespace NActors::NWorkStealing

@@ -7,6 +7,9 @@
 #include "executor_pool_basic.h"
 #include "executor_pool_io.h"
 #include "executor_pool_shared.h"
+#include "workstealing/executor_pool_ws.h"
+#include "workstealing/thread_driver.h"
+#include "workstealing/topology.h"
 
 namespace NActors {
     LWTRACE_USING(ACTORLIB_PROVIDER);
@@ -50,10 +53,10 @@ namespace NActors {
             return Config.Basic[a].PoolId < Config.Basic[b].PoolId;
         });
 
-
         for (ui32 i = 0; i < Config.Basic.size(); ++i) {
-            auto &cfg = Config.Basic[poolIds[i]];
-            i16 sharedThreadCount = cfg.AllThreadsAreShared ? cfg.DefaultThreadCount : cfg.MaxThreadCount ? 1 : 0;
+            auto& cfg = Config.Basic[poolIds[i]];
+            i16 sharedThreadCount = cfg.AllThreadsAreShared ? cfg.DefaultThreadCount : cfg.MaxThreadCount ? 1
+                                                                                                          : 0;
             poolInfos.push_back(TPoolShortInfo{
                 .PoolId = static_cast<i16>(Config.Basic[poolIds[i]].PoolId),
                 .SharedThreadCount = sharedThreadCount,
@@ -69,8 +72,7 @@ namespace NActors {
                 .SharedThreadCount = 0,
                 .ForeignSlots = 0,
                 .InPriorityOrder = false,
-                .PoolName = Config.IO[i].PoolName
-            });
+                .PoolName = Config.IO[i].PoolName});
         }
         Shared = std::make_unique<TSharedExecutorPool>(Config.Shared, poolInfos);
 
@@ -100,12 +102,23 @@ namespace NActors {
         Harmonizer = MakeHarmonizer(ts);
         Harmonizer->SetSharedPool(Shared.get());
 
+        if (Config.WorkStealing && Config.WorkStealing->Enabled) {
+            auto topology = NWorkStealing::TCpuTopology::Discover();
+            // Use TWsConfig from first WS pool config if available, otherwise defaults
+            NWorkStealing::TWsConfig driverConfig;
+            if (!Config.WorkStealing->Pools.empty()) {
+                driverConfig = Config.WorkStealing->Pools[0].WsConfig;
+            }
+            WSDriver_ = std::make_unique<NWorkStealing::TThreadDriver>(driverConfig);
+            WSDriver_->Prepare(topology);
+        }
+
         Executors.Reset(new TAutoPtr<IExecutorPool>[ExecutorPoolCount]);
 
         for (ui32 excIdx = 0; excIdx != ExecutorPoolCount; ++excIdx) {
             Executors[excIdx].Reset(CreateExecutorPool(excIdx));
             bool ignoreThreads = dynamic_cast<TIOExecutorPool*>(Executors[excIdx].Get());
-            TSelfPingInfo *pingInfo = (excIdx < Config.PingInfoByPool.size()) ? &Config.PingInfoByPool[excIdx] : nullptr;
+            TSelfPingInfo* pingInfo = (excIdx < Config.PingInfoByPool.size()) ? &Config.PingInfoByPool[excIdx] : nullptr;
             ignoreThreads &= (Shared != nullptr);
             Harmonizer->AddPool(Executors[excIdx].Get(), pingInfo, ignoreThreads);
         }
@@ -141,6 +154,9 @@ namespace NActors {
         if (Shared) {
             Shared->Start();
         }
+        if (WSDriver_) {
+            WSDriver_->Start();
+        }
         ACTORLIB_DEBUG(EDebugLevel::ActorSystem, "TCpuManager::Start: started");
     }
 
@@ -152,6 +168,9 @@ namespace NActors {
         if (Shared) {
             Shared->PrepareStop();
         }
+        if (WSDriver_) {
+            WSDriver_->PrepareStop();
+        }
         ACTORLIB_DEBUG(EDebugLevel::ActorSystem, "TCpuManager::PrepareStop: prepared");
     }
 
@@ -162,6 +181,9 @@ namespace NActors {
         }
         for (ui32 excIdx = 0; excIdx != ExecutorPoolCount; ++excIdx) {
             Executors[excIdx]->Shutdown();
+        }
+        if (WSDriver_) {
+            WSDriver_->Shutdown();
         }
         for (ui32 round = 0, done = 0; done < ExecutorPoolCount; ++round) {
             Y_ABORT_UNLESS(round < 10, "actorsystem cleanup could not be completed in 10 rounds");
@@ -201,10 +223,31 @@ namespace NActors {
     }
 
     IExecutorPool* TCpuManager::CreateExecutorPool(ui32 poolId) {
+        if (Config.WorkStealing && Config.WorkStealing->Enabled) {
+            for (const auto& wsCfg : Config.WorkStealing->Pools) {
+                if (wsCfg.PoolId == poolId) {
+                    NWorkStealing::TWSExecutorPoolConfig cfg;
+                    cfg.PoolId = wsCfg.PoolId;
+                    cfg.PoolName = wsCfg.PoolName;
+                    cfg.MinSlotCount = wsCfg.MinSlotCount;
+                    cfg.MaxSlotCount = wsCfg.MaxSlotCount;
+                    cfg.DefaultSlotCount = wsCfg.DefaultSlotCount;
+                    cfg.TimePerMailbox = wsCfg.TimePerMailbox;
+                    cfg.EventsPerMailbox = wsCfg.EventsPerMailbox;
+                    cfg.Priority = wsCfg.Priority;
+                    cfg.WsConfig = wsCfg.WsConfig;
+                    auto* pool = new NWorkStealing::TWSExecutorPool(cfg);
+                    if (WSDriver_) {
+                        pool->SetDriver(WSDriver_.get());
+                    }
+                    return pool;
+                }
+            }
+        }
         for (TBasicExecutorPoolConfig& cfg : Config.Basic) {
             if (cfg.PoolId == poolId) {
                 if (Shared) {
-                    auto *pool = new TBasicExecutorPool(cfg, Harmonizer.get(), Jail.get());
+                    auto* pool = new TBasicExecutorPool(cfg, Harmonizer.get(), Jail.get());
                     Shared->SetBasicPool(pool);
                     pool->SetSharedPool(Shared.get());
                     return pool;
@@ -240,17 +283,17 @@ namespace NActors {
         }
     }
 
-    void TCpuManager::GetExecutorPoolState(i16 poolId, TExecutorPoolState &state) const {
+    void TCpuManager::GetExecutorPoolState(i16 poolId, TExecutorPoolState& state) const {
         if (static_cast<ui32>(poolId) < ExecutorPoolCount) {
             Executors[poolId]->GetExecutorPoolState(state);
         }
     }
 
-    void TCpuManager::GetExecutorPoolStates(std::vector<TExecutorPoolState> &states) const {
+    void TCpuManager::GetExecutorPoolStates(std::vector<TExecutorPoolState>& states) const {
         states.resize(ExecutorPoolCount);
         for (i16 poolId = 0; poolId < static_cast<ui16>(ExecutorPoolCount); ++poolId) {
             GetExecutorPoolState(poolId, states[poolId]);
         }
     }
 
-}
+} // namespace NActors

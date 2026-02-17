@@ -1,0 +1,227 @@
+#include "thread_driver.h"
+
+#include <ydb/library/actors/util/datetime.h>
+#include <util/system/yassert.h>
+
+#include <algorithm>
+
+namespace NActors::NWorkStealing {
+
+    // --- TTopologyStealIterator ---
+
+    TTopologyStealIterator::TTopologyStealIterator(
+        const std::vector<TSlot*>& slots,
+        TSlot* exclude,
+        size_t maxProbe)
+        : MaxProbe_(maxProbe)
+    {
+        // Find exclude position and build circular neighbor list starting after it.
+        // Each slot gets a different starting position, distributing steal pressure.
+        size_t excludePos = 0;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i] == exclude) {
+                excludePos = i;
+                break;
+            }
+        }
+
+        Slots_.reserve(slots.size() - 1);
+        for (size_t i = 1; i < slots.size(); ++i) {
+            Slots_.push_back(slots[(excludePos + i) % slots.size()]);
+        }
+    }
+
+    TSlot* TTopologyStealIterator::Next() {
+        if (Probed_ >= MaxProbe_ || Index_ >= Slots_.size()) {
+            return nullptr;
+        }
+        ++Probed_;
+        return Slots_[Index_++];
+    }
+
+    void TTopologyStealIterator::Reset() {
+        // Advance starting position for next steal cycle so we don't
+        // always probe the same neighbors first.
+        if (Slots_.size() > 0) {
+            size_t advance = (Probed_ > 0) ? Probed_ : 1;
+            // Rotate: move front elements to back
+            if (advance < Slots_.size()) {
+                std::rotate(Slots_.begin(), Slots_.begin() + advance, Slots_.end());
+            }
+        }
+        Index_ = 0;
+        Probed_ = 0;
+    }
+
+    // --- TThreadDriver ---
+
+    TThreadDriver::TThreadDriver(const TWsConfig& config)
+        : Config_(config)
+        , Topology_(TCpuTopology::MakeFlat(0))
+    {
+    }
+
+    TThreadDriver::~TThreadDriver() {
+        if (Started_.load(std::memory_order_relaxed)) {
+            Shutdown();
+        }
+    }
+
+    void TThreadDriver::Prepare(const TCpuTopology& topology) {
+        Topology_ = topology;
+    }
+
+    void TThreadDriver::Start() {
+        Started_.store(true, std::memory_order_release);
+
+        struct TContext {
+            TThreadDriver* Driver;
+            TWorker* Worker;
+        };
+
+        for (auto& worker : Workers_) {
+            if (!worker->Slot) {
+                continue;
+            }
+            auto* ctx = new TContext{this, worker.get()};
+            worker->Thread = std::make_unique<TThread>(
+                TThread::TParams(
+                    +[](void* arg) -> void* {
+                        auto* c = static_cast<TContext*>(arg);
+                        c->Driver->WorkerLoop(*c->Worker);
+                        delete c;
+                        return nullptr;
+                    },
+                    ctx)
+                    .SetName("ws_worker"));
+            worker->Thread->Start();
+        }
+    }
+
+    void TThreadDriver::PrepareStop() {
+        Stopping_.store(true, std::memory_order_release);
+        for (auto& worker : Workers_) {
+            worker->ParkPad.Interrupt();
+        }
+    }
+
+    void TThreadDriver::Shutdown() {
+        if (!Started_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        Stopping_.store(true, std::memory_order_release);
+
+        for (auto& worker : Workers_) {
+            worker->ShouldStop.store(true, std::memory_order_release);
+            worker->ParkPad.Interrupt();
+        }
+
+        for (auto& worker : Workers_) {
+            if (worker->Thread && worker->Thread->Running()) {
+                worker->Thread->Join();
+            }
+        }
+
+        Started_.store(false, std::memory_order_release);
+    }
+
+    void TThreadDriver::RegisterSlot(TSlot* slot) {
+        AllSlots_.push_back(slot);
+
+        auto worker = std::make_unique<TWorker>();
+        worker->Slot = slot;
+        worker->WorkerIndex = static_cast<ui16>(Workers_.size());
+        SlotToWorker_[slot] = worker.get();
+        Workers_.push_back(std::move(worker));
+    }
+
+    void TThreadDriver::ActivateSlot(TSlot* slot) {
+        slot->TryTransition(ESlotState::Inactive, ESlotState::Initializing);
+        slot->TryTransition(ESlotState::Initializing, ESlotState::Active);
+
+        // Wake the worker associated with this slot
+        auto it = SlotToWorker_.find(slot);
+        if (it != SlotToWorker_.end()) {
+            it->second->ParkPad.Unpark();
+        }
+    }
+
+    void TThreadDriver::DeactivateSlot(TSlot* slot) {
+        slot->TryTransition(ESlotState::Active, ESlotState::Draining);
+    }
+
+    void TThreadDriver::WakeSlot(TSlot* slot) {
+        slot->Counters.Wakes.fetch_add(1, std::memory_order_relaxed);
+        auto it = SlotToWorker_.find(slot);
+        if (it != SlotToWorker_.end()) {
+            it->second->ParkPad.Unpark();
+        }
+    }
+
+    std::unique_ptr<IStealIterator> TThreadDriver::MakeStealIterator(TSlot* exclude) {
+        return std::make_unique<TTopologyStealIterator>(AllSlots_, exclude, Config_.MaxStealNeighbors);
+    }
+
+    void TThreadDriver::SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) {
+        auto it = SlotToWorker_.find(slot);
+        if (it != SlotToWorker_.end()) {
+            it->second->Callbacks = std::move(callbacks);
+        }
+    }
+
+    void TThreadDriver::WorkerLoop(TWorker& worker) {
+        if (worker.Callbacks.Setup) {
+            worker.Callbacks.Setup();
+        }
+
+        auto stealIterator = MakeStealIterator(worker.Slot);
+        TPollState pollState;
+        ui64 lastLocalWorkTs = GetCycleCountFast();
+
+        while (!worker.ShouldStop.load(std::memory_order_acquire)) {
+            if (worker.Slot->GetState() != ESlotState::Active) {
+                // Slot not active yet or draining -- park
+                worker.ParkPad.Park();
+                if (worker.ShouldStop.load(std::memory_order_acquire)) {
+                    break;
+                }
+                lastLocalWorkTs = GetCycleCountFast();
+                continue;
+            }
+
+            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, Config_, pollState);
+
+            if (pollState.HadLocalWork) {
+                lastLocalWorkTs = GetCycleCountFast();
+            }
+
+            // Park after spinning long enough without local work.
+            // Only local work (activations from this slot's own queues) resets
+            // the spin timer. Stolen work keeps the worker productive but does
+            // not extend spinning — the worker is helping another slot and
+            // should eventually park if its own slot stays idle.
+            // Check on both Idle and stolen-Busy to ensure workers that keep
+            // stealing but have no local work eventually park.
+            if (result == EPollResult::Idle ||
+                (result == EPollResult::Busy && !pollState.HadLocalWork))
+            {
+                ui64 now = GetCycleCountFast();
+                if (now - lastLocalWorkTs > Config_.SpinThresholdCycles) {
+                    worker.Slot->Counters.Parks.fetch_add(1, std::memory_order_relaxed);
+                    worker.ParkPad.Park();
+                    if (worker.ShouldStop.load(std::memory_order_acquire)) {
+                        break;
+                    }
+                    pollState = TPollState{};
+                    lastLocalWorkTs = GetCycleCountFast();
+                }
+            }
+        }
+
+        if (worker.Callbacks.Teardown) {
+            worker.Callbacks.Teardown();
+        }
+    }
+
+} // namespace NActors::NWorkStealing

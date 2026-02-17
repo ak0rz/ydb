@@ -207,6 +207,10 @@ namespace NActors {
 
         EActorPack ActorPack = EActorPack::Empty;
 
+        // Work-stealing: 1-based index of the last slot that executed this mailbox.
+        // 0 means fresh/unassigned. Written by slot after execution (relaxed store).
+        ui16 LastPoolSlotIdx = 0;
+
         static constexpr TMailboxType::EType Type = TMailboxType::LockFreeIntrusive;
 
         TActorsInfo ActorsInfo{ .Empty = {} };

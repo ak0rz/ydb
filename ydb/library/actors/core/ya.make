@@ -105,6 +105,7 @@ PEERDIR(
     ydb/library/actors/actor_type
     ydb/library/actors/interconnect/rdma
     ydb/library/actors/core/harmonizer
+    ydb/library/actors/core/workstealing
     ydb/library/actors/memory_log
     ydb/library/actors/prof
     ydb/library/actors/protos
@@ -131,6 +132,7 @@ END()
 RECURSE(
     harmonizer
     manual_test
+    workstealing
 )
 
 RECURSE_FOR_TESTS(
