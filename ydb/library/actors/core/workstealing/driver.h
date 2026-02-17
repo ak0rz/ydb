@@ -29,7 +29,7 @@ namespace NActors::NWorkStealing {
         virtual void Shutdown() = 0;
 
         // Slot management
-        virtual void RegisterSlot(TSlot* slot) = 0;   // pool registers a slot
+        virtual void RegisterSlots(TSlot* slots, size_t count) = 0; // pool registers a batch of slots (one group per pool)
         virtual void ActivateSlot(TSlot* slot) = 0;   // harmonizer inflates
         virtual void DeactivateSlot(TSlot* slot) = 0; // harmonizer deflates
         virtual void WakeSlot(TSlot* slot) = 0;       // wake the worker owning this slot

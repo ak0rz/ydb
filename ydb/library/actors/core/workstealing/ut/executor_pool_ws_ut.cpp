@@ -40,8 +40,8 @@ namespace NActors::NWorkStealing {
             void Shutdown() override {
             }
 
-            void RegisterSlot(TSlot* /*slot*/) override {
-                RegisteredSlots++;
+            void RegisterSlots(TSlot* /*slots*/, size_t count) override {
+                RegisteredSlots += static_cast<int>(count);
             }
             void ActivateSlot(TSlot* slot) override {
                 slot->TryTransition(ESlotState::Inactive, ESlotState::Initializing);

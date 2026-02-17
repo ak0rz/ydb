@@ -1,5 +1,6 @@
 #include "thread_driver.h"
 
+#include <ydb/library/actors/util/affinity.h>
 #include <ydb/library/actors/util/datetime.h>
 #include <util/system/yassert.h>
 
@@ -29,6 +30,14 @@ namespace NActors::NWorkStealing {
         for (size_t i = 1; i < slots.size(); ++i) {
             Slots_.push_back(slots[(excludePos + i) % slots.size()]);
         }
+    }
+
+    TTopologyStealIterator::TTopologyStealIterator(
+        std::vector<TSlot*> orderedSlots,
+        size_t maxProbe)
+        : Slots_(std::move(orderedSlots))
+        , MaxProbe_(maxProbe)
+    {
     }
 
     TSlot* TTopologyStealIterator::Next() {
@@ -69,6 +78,13 @@ namespace NActors::NWorkStealing {
 
     void TThreadDriver::Prepare(const TCpuTopology& topology) {
         Topology_ = topology;
+        if (topology.GetCpuCount() > 0) {
+            TCpuId seed = 0;
+            auto neighbors = topology.GetNeighborsOrdered(seed);
+            GlobalCpuOrder_.reserve(1 + neighbors.size());
+            GlobalCpuOrder_.push_back(seed);
+            GlobalCpuOrder_.insert(GlobalCpuOrder_.end(), neighbors.begin(), neighbors.end());
+        }
     }
 
     void TThreadDriver::Start() {
@@ -126,14 +142,32 @@ namespace NActors::NWorkStealing {
         Started_.store(false, std::memory_order_release);
     }
 
-    void TThreadDriver::RegisterSlot(TSlot* slot) {
-        AllSlots_.push_back(slot);
+    void TThreadDriver::RegisterSlots(TSlot* slots, size_t count) {
+        TSlotGroup group;
+        ui16 groupIdx = static_cast<ui16>(Groups_.size());
 
-        auto worker = std::make_unique<TWorker>();
-        worker->Slot = slot;
-        worker->WorkerIndex = static_cast<ui16>(Workers_.size());
-        slot->DriverData = worker.get();
-        Workers_.push_back(std::move(worker));
+        for (size_t i = 0; i < count; ++i) {
+            TSlot* slot = &slots[i];
+            AllSlots_.push_back(slot);
+
+            auto worker = std::make_unique<TWorker>();
+            worker->Slot = slot;
+            worker->WorkerIndex = static_cast<ui16>(Workers_.size());
+            worker->GroupIndex = groupIdx;
+            slot->DriverData = worker.get();
+
+            // Assign CPU from global topology order
+            if (!GlobalCpuOrder_.empty()) {
+                worker->AssignedCpu = GlobalCpuOrder_[
+                    (NextCpuOffset_ + i) % GlobalCpuOrder_.size()];
+            }
+
+            group.Workers.push_back(worker.get());
+            Workers_.push_back(std::move(worker));
+        }
+
+        NextCpuOffset_ += count;
+        Groups_.push_back(std::move(group));
     }
 
     void TThreadDriver::ActivateSlot(TSlot* slot) {
@@ -167,7 +201,30 @@ namespace NActors::NWorkStealing {
     }
 
     std::unique_ptr<IStealIterator> TThreadDriver::MakeStealIterator(TSlot* exclude) {
-        return std::make_unique<TTopologyStealIterator>(AllSlots_, exclude, Config_.MaxStealNeighbors);
+        auto* worker = static_cast<TWorker*>(exclude->DriverData);
+        if (!worker || Groups_.empty()) {
+            return std::make_unique<TTopologyStealIterator>(AllSlots_, exclude, Config_.MaxStealNeighbors);
+        }
+
+        // Build slot list from same group only, excluding self.
+        // Start from worker's position + 1, wrap around (closest neighbors first).
+        auto& group = Groups_[worker->GroupIndex];
+        std::vector<TSlot*> groupSlots;
+        groupSlots.reserve(group.Workers.size() - 1);
+
+        size_t selfPos = 0;
+        for (size_t i = 0; i < group.Workers.size(); ++i) {
+            if (group.Workers[i]->Slot == exclude) {
+                selfPos = i;
+                break;
+            }
+        }
+        for (size_t j = 1; j < group.Workers.size(); ++j) {
+            size_t idx = (selfPos + j) % group.Workers.size();
+            groupSlots.push_back(group.Workers[idx]->Slot);
+        }
+
+        return std::make_unique<TTopologyStealIterator>(std::move(groupSlots), Config_.MaxStealNeighbors);
     }
 
     void TThreadDriver::SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) {
@@ -178,6 +235,12 @@ namespace NActors::NWorkStealing {
     }
 
     void TThreadDriver::WorkerLoop(TWorker& worker) {
+        // Pin to assigned CPU
+        if (!GlobalCpuOrder_.empty()) {
+            TAffinity affinity(TCpuMask(worker.AssignedCpu));
+            affinity.Set();
+        }
+
         if (worker.Callbacks.Setup) {
             worker.Callbacks.Setup();
         }

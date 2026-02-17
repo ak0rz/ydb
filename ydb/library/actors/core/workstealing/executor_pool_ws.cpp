@@ -70,9 +70,7 @@ namespace NActors::NWorkStealing {
 
         // Register all slots with the driver and wire per-worker callbacks
         if (Driver_) {
-            for (i16 i = 0; i < MaxSlotCount_; ++i) {
-                Driver_->RegisterSlot(&Slots_[i]);
-            }
+            Driver_->RegisterSlots(Slots_.data(), static_cast<size_t>(MaxSlotCount_));
 
             TMailboxTable* mboxTable = MailboxTable;
             auto* pool = this;

@@ -28,7 +28,7 @@ namespace NActors::NWorkStealing {
         void PrepareStop() override;
         void Shutdown() override;
 
-        void RegisterSlot(TSlot* slot) override;
+        void RegisterSlots(TSlot* slots, size_t count) override;
         void ActivateSlot(TSlot* slot) override;
         void DeactivateSlot(TSlot* slot) override;
         void WakeSlot(TSlot* slot) override;
@@ -44,7 +44,13 @@ namespace NActors::NWorkStealing {
             NActors::TThreadParkPad ParkPad;
             std::atomic<bool> ShouldStop{false};
             ui16 WorkerIndex = 0;
+            ui16 GroupIndex = 0;      // which slot group (pool) this worker belongs to
+            TCpuId AssignedCpu = 0;   // CPU to pin to
             TWorkerCallbacks Callbacks;
+        };
+
+        struct TSlotGroup {
+            std::vector<TWorker*> Workers; // workers in registration order (= topology order)
         };
 
         void WorkerLoop(TWorker& worker);
@@ -54,6 +60,9 @@ namespace NActors::NWorkStealing {
 
         std::vector<std::unique_ptr<TWorker>> Workers_;
         std::vector<TSlot*> AllSlots_; // all registered slots
+        std::vector<TSlotGroup> Groups_;
+        std::vector<TCpuId> GlobalCpuOrder_;   // all CPUs in topology order from seed
+        size_t NextCpuOffset_ = 0;            // next available position in GlobalCpuOrder_
 
         std::atomic<bool> Started_{false};
         std::atomic<bool> Stopping_{false};
@@ -65,6 +74,7 @@ namespace NActors::NWorkStealing {
     class TTopologyStealIterator: public IStealIterator {
     public:
         TTopologyStealIterator(const std::vector<TSlot*>& slots, TSlot* exclude, size_t maxProbe);
+        TTopologyStealIterator(std::vector<TSlot*> orderedSlots, size_t maxProbe);
 
         TSlot* Next() override;
         void Reset() override;

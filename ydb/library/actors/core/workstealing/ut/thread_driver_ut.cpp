@@ -34,7 +34,7 @@ namespace NActors::NWorkStealing {
             driver.Prepare(topology);
 
             TSlot slot;
-            driver.RegisterSlot(&slot);
+            driver.RegisterSlots(&slot, 1);
 
             SetSimpleCallback(driver, slot, [](ui32) -> bool { return false; });
             driver.Start();
@@ -56,7 +56,7 @@ namespace NActors::NWorkStealing {
             driver.Prepare(topology);
 
             TSlot slot;
-            driver.RegisterSlot(&slot);
+            driver.RegisterSlots(&slot, 1);
 
             std::atomic<int> counter{0};
             SetSimpleCallback(driver, slot, [&counter](ui32) -> bool {
@@ -95,7 +95,7 @@ namespace NActors::NWorkStealing {
             driver.Prepare(topology);
 
             TSlot slot;
-            driver.RegisterSlot(&slot);
+            driver.RegisterSlots(&slot, 1);
 
             SetSimpleCallback(driver, slot, [](ui32) -> bool { return false; });
             driver.Start();
@@ -164,17 +164,15 @@ namespace NActors::NWorkStealing {
             auto topology = TCpuTopology::MakeFlat(4);
             driver.Prepare(topology);
 
-            TSlot slot1;
-            TSlot slot2;
-            driver.RegisterSlot(&slot1);
-            driver.RegisterSlot(&slot2);
+            TSlot slots[2];
+            driver.RegisterSlots(slots, 2);
 
-            SetSimpleCallback(driver, slot1, [](ui32) -> bool { return false; });
-            SetSimpleCallback(driver, slot2, [](ui32) -> bool { return false; });
+            SetSimpleCallback(driver, slots[0], [](ui32) -> bool { return false; });
+            SetSimpleCallback(driver, slots[1], [](ui32) -> bool { return false; });
             driver.Start();
 
-            driver.ActivateSlot(&slot1);
-            driver.ActivateSlot(&slot2);
+            driver.ActivateSlot(&slots[0]);
+            driver.ActivateSlot(&slots[1]);
             Sleep(TDuration::MilliSeconds(50));
 
             driver.PrepareStop();
@@ -190,7 +188,7 @@ namespace NActors::NWorkStealing {
             driver.Prepare(topology);
 
             TSlot slot;
-            driver.RegisterSlot(&slot);
+            driver.RegisterSlots(&slot, 1);
 
             std::atomic<int> counter{0};
             SetSimpleCallback(driver, slot, [&counter](ui32) -> bool {
@@ -229,7 +227,7 @@ namespace NActors::NWorkStealing {
             driver.Prepare(topology);
 
             TSlot slot;
-            driver.RegisterSlot(&slot);
+            driver.RegisterSlots(&slot, 1);
 
             std::atomic<bool> setupCalled{false};
             std::atomic<bool> teardownCalled{false};
