@@ -16,7 +16,9 @@ namespace NActors::NWorkStealing {
 
         // Helper: drain a slot's injection queue into its work deque.
         static size_t DrainSlot(TSlot& slot, size_t max = 1024) {
-            return slot.DrainInjectionQueue(max);
+            Y_UNUSED(slot);
+            Y_UNUSED(max);
+            return 0;
         }
 
         Y_UNIT_TEST(FreshMailboxDistributes) {
@@ -38,8 +40,8 @@ namespace NActors::NWorkStealing {
             DrainSlot(slots[0]);
             DrainSlot(slots[1]);
 
-            bool slot0HasWork = slots[0].PopActivation().has_value();
-            bool slot1HasWork = slots[1].PopActivation().has_value();
+            bool slot0HasWork = slots[0].Pop().has_value();
+            bool slot1HasWork = slots[1].Pop().has_value();
             UNIT_ASSERT(slot0HasWork || slot1HasWork);
         }
 
@@ -57,7 +59,7 @@ namespace NActors::NWorkStealing {
 
             // Verify the hint was injected into slot 1
             DrainSlot(slots[1]);
-            auto item = slots[1].PopActivation();
+            auto item = slots[1].Pop();
             UNIT_ASSERT(item.has_value());
             UNIT_ASSERT_VALUES_EQUAL(*item, 42u);
         }
@@ -79,7 +81,7 @@ namespace NActors::NWorkStealing {
 
             // Verify the hint went to slot 0
             DrainSlot(slots[0]);
-            auto item = slots[0].PopActivation();
+            auto item = slots[0].Pop();
             UNIT_ASSERT(item.has_value());
             UNIT_ASSERT_VALUES_EQUAL(*item, 42u);
         }

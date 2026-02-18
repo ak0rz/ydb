@@ -19,7 +19,6 @@ PEERDIR(
 END()
 
 RECURSE(
-    bench
     bench/system
 )
 

@@ -19,10 +19,8 @@ namespace NActors::NWorkStealing {
         if (lastSlotIdx > 0 && lastSlotIdx <= activeCount) {
             size_t idx = lastSlotIdx - 1;
             if (Slots_[idx].GetState() == ESlotState::Active) {
-                if (Slots_[idx].Inject(hint)) {
-                    return static_cast<int>(idx);
-                }
-                // Inject failed (slot transitioning away) -- fall through to hash
+                Slots_[idx].Push(hint);
+                return static_cast<int>(idx);
             }
         }
 
@@ -31,8 +29,6 @@ namespace NActors::NWorkStealing {
     }
 
     void TActivationRouter::RefreshActiveSlots() {
-        // Count contiguous active slots from the beginning.
-        // SetFullThreadCount guarantees active slots are 0..N-1.
         ui16 count = 0;
         for (size_t i = 0; i < SlotCount_; ++i) {
             if (Slots_[i].GetState() == ESlotState::Active) {
@@ -46,14 +42,13 @@ namespace NActors::NWorkStealing {
 
     int TActivationRouter::PowerOfTwoHash(ui32 hint, ui16 activeCount) {
         if (activeCount == 1) {
-            if (Slots_[0].Inject(hint)) {
+            if (Slots_[0].GetState() == ESlotState::Active) {
+                Slots_[0].Push(hint);
                 return 0;
             }
             return -1;
         }
 
-        // Derive two candidate indices from the hint using mix functions.
-        // This is deterministic per-hint (no shared mutable state).
         ui32 h1 = hint;
         ui32 h2 = hint ^ 0x5bd1e995u;
         h2 = (h2 >> 16) ^ (h2 * 0x45d9f3bu);
@@ -64,22 +59,24 @@ namespace NActors::NWorkStealing {
             idxB = (idxA + 1) % activeCount;
         }
 
-        // Choose the slot with lower estimated load, fall back to the other
         size_t first = (Slots_[idxA].SizeEstimate() <= Slots_[idxB].SizeEstimate())
                             ? idxA
                             : idxB;
         size_t second = (first == idxA) ? idxB : idxA;
 
-        if (Slots_[first].Inject(hint)) {
+        if (Slots_[first].GetState() == ESlotState::Active) {
+            Slots_[first].Push(hint);
             return static_cast<int>(first);
         }
-        if (Slots_[second].Inject(hint)) {
+        if (Slots_[second].GetState() == ESlotState::Active) {
+            Slots_[second].Push(hint);
             return static_cast<int>(second);
         }
 
         // All candidates transitioning away — try any active slot
         for (ui16 i = 0; i < activeCount; ++i) {
-            if (Slots_[i].Inject(hint)) {
+            if (Slots_[i].GetState() == ESlotState::Active) {
+                Slots_[i].Push(hint);
                 return static_cast<int>(i);
             }
         }

@@ -47,20 +47,15 @@ namespace NActors::NWorkStealing {
     // Core polling routine for a single slot.
     //
     // Algorithm:
-    // 1. Drain MPSC injection queue into Chase-Lev deque (up to config.MaxDrainBatch)
-    // 2. Pop and execute in a loop (up to config.MaxExecBatch activations)
-    //    - Drains once, then processes all available activations before returning.
-    //      This prevents LIFO starvation where recently re-injected activations
-    //      perpetually bury older ones.
+    // 1. Pop and execute from our MPMC queue (up to config.MaxExecBatch)
     //    - For each: call executeCallback(hint)
-    //    - If callback returns true (budget depleted): reinject hint
+    //    - If callback returns true (budget depleted): push hint back
     //    - Return Busy if any work was done
-    // 3. No local work: try stealing from neighbors via stealIterator
-    //    - StealIterator->Next() returns neighbor slots in topology order
-    //    - For each neighbor: StealHalf into temp buffer, push stolen items into our deque
+    // 2. No local work: try stealing from neighbors via stealIterator
+    //    - StealHalf into stack buffer, push stolen items into our queue
     //    - Execute stolen items (up to remaining budget)
     //    - Return Busy if any work was done
-    // 4. Nothing found anywhere: return Idle
+    // 3. Nothing found anywhere: return Idle
     EPollResult PollSlot(
         TSlot& slot,
         IStealIterator* stealIterator,

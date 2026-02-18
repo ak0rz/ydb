@@ -20,7 +20,7 @@ namespace NActors::NWorkStealing {
     // 2. If non-zero: try that slot; if Active, inject there (sticky routing)
     // 3. If zero or target slot not Active: power-of-two hash choice
     //    - Derive 2 candidate slots from hint, choose the one with lower SizeEstimate()
-    // 4. Inject into chosen slot's MPSC queue
+    // 4. Push into chosen slot's MPMC queue
     class TActivationRouter {
     public:
         TActivationRouter(TSlot* slots, size_t slotCount);

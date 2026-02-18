@@ -1,14 +1,17 @@
 #pragma once
 
-#include "chase_lev_deque.h"
-#include "vyukov_mpsc_queue.h"
 #include "ws_counters.h"
 
 #include <util/system/types.h>
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
+
+namespace NActors {
+    class TRingActivationQueueV4;
+}
 
 namespace NActors::NWorkStealing {
 
@@ -28,8 +31,8 @@ namespace NActors::NWorkStealing {
 
     // Scheduling slot for the work-stealing runtime.
     //
-    // Each slot owns an injection queue (MPSC, multiple producers push activations)
-    // and a local work deque (Chase-Lev SPMC, owner pops, stealers steal).
+    // Each slot owns a single MPMC activation queue (TRingActivationQueueV4).
+    // Any thread can Push/Pop activations; StealHalf pops a batch for stealers.
     //
     // State machine:
     //   Inactive -> Initializing  (driver assigns to worker)
@@ -39,64 +42,35 @@ namespace NActors::NWorkStealing {
     //
     // All other transitions are rejected.
     struct alignas(64) TSlot {
+        TSlot();
+        ~TSlot();
+
         // --- State machine ---
 
-        // Attempt a state transition via CAS.
-        // Returns true if the transition was performed.
         bool TryTransition(ESlotState from, ESlotState to);
-
-        // Current state (relaxed read -- use for diagnostics / non-critical checks).
         ESlotState GetState() const;
 
-        // --- Producer API (any thread) ---
+        // --- Push/Pop API ---
 
-        // Inject an activation hint into this slot's MPSC queue.
-        // Returns false if the slot is not Active.
-        bool Inject(ui32 hint);
+        // Push an activation into this slot's MPMC queue.
+        void Push(ui32 hint);
 
-        // --- Owner API (single consumer thread) ---
-
-        // Drain up to maxBatch items from the injection queue into the local deque.
-        // Returns the number of items drained.
-        size_t DrainInjectionQueue(size_t maxBatch);
-
-        // Pop the next activation from the local deque (LIFO for the owner).
-        std::optional<ui32> PopActivation();
-
-        // Push an activation back into the MPSC queue for rescheduling.
-        void Reinject(ui32 hint);
-
-        // Push a stolen activation directly into the local work deque.
-        // Only called by the owner thread after stealing from a neighbor.
-        // Returns false if the deque is full.
-        bool PushStolen(ui32 hint);
+        // Pop the next activation. Returns nullopt if the queue is empty.
+        std::optional<ui32> Pop();
 
         // --- Stealer API (any thread) ---
 
-        // Steal up to half the items from the local deque.
-        // Writes stolen hints to out[0..N-1], returns N.
-        // Only operates when state is Active or Draining.
+        // Steal up to half the items from this slot's MPMC queue.
         size_t StealHalf(ui32* out, size_t max);
 
         // --- Metrics ---
 
-        // Approximate total work in this slot (deque size estimate).
         size_t SizeEstimate() const;
-
-        // --- Stats ---
-
-        // Check if injection queue has pending items (consumer thread only).
-        bool HasPendingInjections() const;
+        bool HasWork() const;
 
         // --- Driver integration ---
 
-        // True when the owning worker is actively polling (not parked).
-        // Used by WakeSlot to skip redundant Unpark calls.
-        // Protocol: worker sets false (seq_cst) before parking, checks MPSC
-        // after (Dekker). WakeSlot reads (seq_cst) — if true, skips wake.
         std::atomic<bool> WorkerSpinning{false};
-
-        // Opaque pointer for driver use (e.g., TWorker*). Eliminates hash map.
         void* DriverData = nullptr;
 
         // --- Stats ---
@@ -108,10 +82,10 @@ namespace NActors::NWorkStealing {
     private:
         std::atomic<ESlotState> State_{ESlotState::Inactive};
 
-        TVyukovMPSCQueue<ui32, 64> InjectionQueue_;
-        TChaseLevDeque<ui32, 256> WorkDeque_;
+        std::unique_ptr<NActors::TRingActivationQueueV4> Queue_;
+        alignas(64) std::atomic<ui64> PopCounter_{0};
+        alignas(64) std::atomic<i64> ApproxSize_{0};
 
-        // Validates that the (from -> to) transition is allowed by the state machine.
         static bool IsValidTransition(ESlotState from, ESlotState to);
     };
 

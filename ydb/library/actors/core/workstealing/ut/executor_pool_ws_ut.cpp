@@ -189,13 +189,10 @@ namespace NActors::NWorkStealing {
             bool found = false;
             for (size_t i = 0; i < pool.GetSlotCount(); ++i) {
                 if (slots[i].GetState() == ESlotState::Active) {
-                    size_t drained = slots[i].DrainInjectionQueue(64);
-                    if (drained > 0) {
-                        auto item = slots[i].PopActivation();
-                        if (item.has_value() && *item == 42u) {
-                            found = true;
-                            break;
-                        }
+                    auto item = slots[i].Pop();
+                    if (item.has_value() && *item == 42u) {
+                        found = true;
+                        break;
                     }
                 }
             }
@@ -220,9 +217,7 @@ namespace NActors::NWorkStealing {
 
             // Should route to slot 2 (sticky)
             TSlot* slots = pool.GetSlots();
-            size_t drained = slots[2].DrainInjectionQueue(64);
-            UNIT_ASSERT(drained > 0);
-            auto item = slots[2].PopActivation();
+            auto item = slots[2].Pop();
             UNIT_ASSERT(item.has_value());
             UNIT_ASSERT_VALUES_EQUAL(*item, 99u);
         }
@@ -332,13 +327,10 @@ namespace NActors::NWorkStealing {
             bool found = false;
             for (size_t i = 0; i < pool.GetSlotCount(); ++i) {
                 if (slots[i].GetState() == ESlotState::Active) {
-                    size_t drained = slots[i].DrainInjectionQueue(64);
-                    if (drained > 0) {
-                        auto item = slots[i].PopActivation();
-                        if (item.has_value() && *item == 55u) {
-                            found = true;
-                            break;
-                        }
+                    auto item = slots[i].Pop();
+                    if (item.has_value() && *item == 55u) {
+                        found = true;
+                        break;
                     }
                 }
             }
@@ -366,13 +358,10 @@ namespace NActors::NWorkStealing {
             bool found = false;
             for (size_t i = 0; i < pool.GetSlotCount(); ++i) {
                 if (slots[i].GetState() == ESlotState::Active) {
-                    size_t drained = slots[i].DrainInjectionQueue(64);
-                    if (drained > 0) {
-                        auto item = slots[i].PopActivation();
-                        if (item.has_value() && *item == 77u) {
-                            found = true;
-                            break;
-                        }
+                    auto item = slots[i].Pop();
+                    if (item.has_value() && *item == 77u) {
+                        found = true;
+                        break;
                     }
                 }
             }

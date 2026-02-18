@@ -255,8 +255,48 @@ namespace NActors::NWorkStealing {
         worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
 
         while (!worker.ShouldStop.load(std::memory_order_acquire)) {
-            if (worker.Slot->GetState() != ESlotState::Active) {
-                // Slot not active yet or draining -- park
+            ESlotState slotState = worker.Slot->GetState();
+
+            if (slotState == ESlotState::Draining) {
+                // Drain remaining activations without stealing — slot is winding down.
+                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, Config_, pollState);
+                if (result == EPollResult::Busy) {
+                    lastLocalWorkTs = GetCycleCountFast();
+                    continue;
+                }
+
+                // Queue appears empty. Dekker: announce not-spinning, re-check
+                // for items from in-flight Route() calls that saw Active before
+                // the transition.
+                worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
+                if (worker.Slot->HasWork()) {
+                    worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                    continue;
+                }
+
+                // Complete deactivation.
+                worker.Slot->TryTransition(ESlotState::Draining, ESlotState::Inactive);
+
+                // Final safety net: execute items that raced with the transition.
+                // After Inactive, no new Route() calls will target this slot.
+                while (auto item = worker.Slot->Pop()) {
+                    if (worker.Callbacks.Execute) {
+                        worker.Callbacks.Execute(*item);
+                    }
+                }
+
+                worker.ParkPad.Park();
+                worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                if (worker.ShouldStop.load(std::memory_order_acquire)) {
+                    break;
+                }
+                lastLocalWorkTs = GetCycleCountFast();
+                spinThreshold = Config_.MinSpinThresholdCycles;
+                continue;
+            }
+
+            if (slotState != ESlotState::Active) {
+                // Inactive or Initializing — park and wait for activation.
                 worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
                 worker.ParkPad.Park();
                 worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
@@ -294,7 +334,7 @@ namespace NActors::NWorkStealing {
                     //  - We see the injection → skip park
                     worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
 
-                    if (worker.Slot->HasPendingInjections()) {
+                    if (worker.Slot->HasWork()) {
                         // Work arrived between last poll and now — don't park
                         worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
                         lastLocalWorkTs = GetCycleCountFast();

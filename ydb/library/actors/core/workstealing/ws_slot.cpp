@@ -1,8 +1,20 @@
 #include "ws_slot.h"
 
+#include <ydb/library/actors/core/thread_context.h>
+#include <ydb/library/actors/queues/activation_queue.h>
+
 #include <util/system/yassert.h>
 
+#include <algorithm>
+
 namespace NActors::NWorkStealing {
+
+    TSlot::TSlot()
+        : Queue_(std::make_unique<NActors::TRingActivationQueueV4>(8))
+    {
+    }
+
+    TSlot::~TSlot() = default;
 
     bool TSlot::IsValidTransition(ESlotState from, ESlotState to) {
         switch (from) {
@@ -30,38 +42,19 @@ namespace NActors::NWorkStealing {
         return State_.load(std::memory_order_relaxed);
     }
 
-    bool TSlot::Inject(ui32 hint) {
-        if (State_.load(std::memory_order_acquire) != ESlotState::Active) {
-            return false;
+    void TSlot::Push(ui32 hint) {
+        Queue_->Push(hint, 0);
+        ApproxSize_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::optional<ui32> TSlot::Pop() {
+        ui64 counter = PopCounter_.fetch_add(1, std::memory_order_relaxed);
+        ui32 result = Queue_->Pop(counter);
+        if (result == 0) {
+            return std::nullopt;
         }
-        InjectionQueue_.Push(hint);
-        return true;
-    }
-
-    size_t TSlot::DrainInjectionQueue(size_t maxBatch) {
-        size_t count = 0;
-        while (count < maxBatch) {
-            auto item = InjectionQueue_.TryPop();
-            if (!item) {
-                break;
-            }
-            // Push into local Chase-Lev deque. If full, re-inject into MPSC
-            // so the item is not lost.
-            if (!WorkDeque_.Push(*item)) {
-                InjectionQueue_.Push(*item);
-                break;
-            }
-            ++count;
-        }
-        return count;
-    }
-
-    std::optional<ui32> TSlot::PopActivation() {
-        return WorkDeque_.PopOwner();
-    }
-
-    void TSlot::Reinject(ui32 hint) {
-        InjectionQueue_.Push(hint);
+        ApproxSize_.fetch_sub(1, std::memory_order_relaxed);
+        return result;
     }
 
     size_t TSlot::StealHalf(ui32* out, size_t max) {
@@ -69,19 +62,28 @@ namespace NActors::NWorkStealing {
         if (state != ESlotState::Active && state != ESlotState::Draining) {
             return 0;
         }
-        return WorkDeque_.StealHalf(out, max);
+        size_t estimate = SizeEstimate();
+        size_t target = std::min(std::max(estimate / 2, size_t(1)), max);
+        size_t count = 0;
+        while (count < target) {
+            ui64 counter = PopCounter_.fetch_add(1, std::memory_order_relaxed);
+            ui32 item = Queue_->Pop(counter);
+            if (item == 0) {
+                break;
+            }
+            ApproxSize_.fetch_sub(1, std::memory_order_relaxed);
+            out[count++] = item;
+        }
+        return count;
     }
 
-    bool TSlot::PushStolen(ui32 hint) {
-        return WorkDeque_.Push(hint);
-    }
-
-    bool TSlot::HasPendingInjections() const {
-        return InjectionQueue_.NonEmpty();
+    bool TSlot::HasWork() const {
+        return ApproxSize_.load(std::memory_order_relaxed) > 0;
     }
 
     size_t TSlot::SizeEstimate() const {
-        return WorkDeque_.SizeEstimate();
+        i64 size = ApproxSize_.load(std::memory_order_relaxed);
+        return (size > 0) ? static_cast<size_t>(size) : 0;
     }
 
 } // namespace NActors::NWorkStealing

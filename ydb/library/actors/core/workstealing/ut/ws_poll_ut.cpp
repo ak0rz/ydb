@@ -47,7 +47,7 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             ActivateSlot(slot);
 
-            UNIT_ASSERT(slot.Inject(42));
+            slot.Push(42);
 
             ui32 received = 0;
             bool callbackCalled = false;
@@ -88,7 +88,7 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             ActivateSlot(slot);
 
-            UNIT_ASSERT(slot.Inject(7));
+            slot.Push(7);
 
             TExecuteCallback cb = [&](ui32) -> bool {
                 return true; // budget depleted
@@ -101,8 +101,7 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
 
             // The activation should have been reinjected.
-            slot.DrainInjectionQueue(config.MaxDrainBatch);
-            auto item = slot.PopActivation();
+            auto item = slot.Pop();
             UNIT_ASSERT(item.has_value());
             UNIT_ASSERT_VALUES_EQUAL(*item, 7u);
         }
@@ -111,7 +110,7 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             ActivateSlot(slot);
 
-            UNIT_ASSERT(slot.Inject(7));
+            slot.Push(7);
 
             TExecuteCallback cb = [&](ui32) -> bool {
                 return false; // mailbox empty, done
@@ -124,8 +123,7 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
 
             // The activation should NOT have been reinjected.
-            slot.DrainInjectionQueue(config.MaxDrainBatch);
-            auto item = slot.PopActivation();
+            auto item = slot.Pop();
             UNIT_ASSERT(!item.has_value());
         }
 
@@ -138,9 +136,8 @@ namespace NActors::NWorkStealing {
 
             // Put work into slotB
             for (ui32 i = 0; i < 10; ++i) {
-                UNIT_ASSERT(slotB.Inject(100 + i));
+                slotB.Push(100 + i);
             }
-            slotB.DrainInjectionQueue(64);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);
@@ -188,9 +185,9 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             ActivateSlot(slot);
 
-            // Inject multiple items
+            // Inject multiple items (1-based: 0 means "empty" in MPMC queue)
             for (ui32 i = 0; i < 5; ++i) {
-                UNIT_ASSERT(slot.Inject(i));
+                slot.Push(i + 1);
             }
 
             std::vector<ui32> executed;
@@ -202,7 +199,7 @@ namespace NActors::NWorkStealing {
             TWsConfig config;
             TPollState ps;
 
-            // PollSlot processes all drained activations in a single call
+            // PollSlot processes all activations in a single call
             EPollResult result = PollSlot(slot, nullptr, cb, config, ps);
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
             UNIT_ASSERT_VALUES_EQUAL(executed.size(), 5u);
@@ -210,7 +207,7 @@ namespace NActors::NWorkStealing {
             // All 5 hints should have been executed (order may vary)
             std::sort(executed.begin(), executed.end());
             for (ui32 i = 0; i < 5; ++i) {
-                UNIT_ASSERT_VALUES_EQUAL(executed[i], i);
+                UNIT_ASSERT_VALUES_EQUAL(executed[i], i + 1);
             }
 
             // Subsequent call should be idle
@@ -227,9 +224,8 @@ namespace NActors::NWorkStealing {
 
             // Put multiple items into slotB
             for (ui32 i = 0; i < 6; ++i) {
-                UNIT_ASSERT(slotB.Inject(200 + i));
+                slotB.Push(200 + i);
             }
-            slotB.DrainInjectionQueue(64);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);
@@ -281,9 +277,8 @@ namespace NActors::NWorkStealing {
             ActivateSlot(slotB);
 
             for (ui32 i = 0; i < 10; ++i) {
-                UNIT_ASSERT(slotB.Inject(300 + i));
+                slotB.Push(300 + i);
             }
-            slotB.DrainInjectionQueue(64);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);

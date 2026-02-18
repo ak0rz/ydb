@@ -12,13 +12,9 @@ namespace NActors::NWorkStealing {
         bool didWork = false;
         size_t execBudget = config.MaxExecBatch;
 
-        // Step 1: Drain injection queue into local deque
-        size_t drained = slot.DrainInjectionQueue(config.MaxDrainBatch);
-        slot.Counters.DrainedItems.fetch_add(drained, std::memory_order_relaxed);
-
-        // Step 2: Pop and execute in a loop until deque is empty or budget exhausted.
+        // Step 1: Pop and execute from our queue.
         while (execBudget > 0) {
-            auto activation = slot.PopActivation();
+            auto activation = slot.Pop();
             if (!activation) {
                 break;
             }
@@ -28,7 +24,7 @@ namespace NActors::NWorkStealing {
 
             bool budgetDepleted = executeCallback(*activation);
             if (budgetDepleted) {
-                slot.Reinject(*activation);
+                slot.Push(*activation);
             }
         }
 
@@ -41,8 +37,7 @@ namespace NActors::NWorkStealing {
             return EPollResult::Busy;
         }
 
-        // Step 3: Nothing local -- try stealing with exponential backoff.
-        // First steal at StarvationGuardLimit idle polls, then double the interval on each failure.
+        // Step 2: Nothing local -- try stealing with exponential backoff.
         ++pollState.ConsecutiveIdle;
 
         if (pollState.NextStealAtIdle == 0) {
@@ -58,49 +53,46 @@ namespace NActors::NWorkStealing {
 
             stealIterator->Reset();
             while (TSlot* victim = stealIterator->Next()) {
-                // Skip empty victims — avoids CAS overhead in StealHalf
                 if (victim->SizeEstimate() == 0) {
                     continue;
                 }
                 slot.Counters.StealAttempts.fetch_add(1, std::memory_order_relaxed);
+
+                // Tight pop loop: pull from victim into stack buffer
                 size_t stolen = victim->StealHalf(stealBuf, kStealBufSize);
-                if (stolen > 0) {
-                    slot.Counters.StolenItems.fetch_add(stolen, std::memory_order_relaxed);
+                if (stolen == 0) {
+                    continue;
+                }
+                slot.Counters.StolenItems.fetch_add(stolen, std::memory_order_relaxed);
 
-                    // Push stolen items into our local deque
-                    for (size_t i = 0; i < stolen; ++i) {
-                        if (!slot.PushStolen(stealBuf[i])) {
-                            for (size_t j = i; j < stolen; ++j) {
-                                slot.Reinject(stealBuf[j]);
-                            }
-                            break;
-                        }
+                // Tight push loop: transfer buffer into our queue
+                for (size_t i = 0; i < stolen; ++i) {
+                    slot.Push(stealBuf[i]);
+                }
+
+                // Execute from our queue
+                while (execBudget > 0) {
+                    auto activation = slot.Pop();
+                    if (!activation) {
+                        break;
                     }
+                    didWork = true;
+                    --execBudget;
+                    slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
 
-                    // Execute stolen items
-                    while (execBudget > 0) {
-                        auto activation = slot.PopActivation();
-                        if (!activation) {
-                            break;
-                        }
-                        didWork = true;
-                        --execBudget;
-                        slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
-
-                        bool budgetDepleted = executeCallback(*activation);
-                        if (budgetDepleted) {
-                            slot.Reinject(*activation);
-                        }
+                    bool budgetDepleted = executeCallback(*activation);
+                    if (budgetDepleted) {
+                        slot.Push(*activation);
                     }
+                }
 
-                    if (didWork) {
-                        slot.Counters.BusyPolls.fetch_add(1, std::memory_order_relaxed);
-                        pollState.ConsecutiveIdle = 0;
-                        pollState.NextStealAtIdle = 0;
-                        pollState.StealInterval = 0;
-                        pollState.HadLocalWork = false; // stolen work, not local
-                        return EPollResult::Busy;
-                    }
+                if (didWork) {
+                    slot.Counters.BusyPolls.fetch_add(1, std::memory_order_relaxed);
+                    pollState.ConsecutiveIdle = 0;
+                    pollState.NextStealAtIdle = 0;
+                    pollState.StealInterval = 0;
+                    pollState.HadLocalWork = false;
+                    return EPollResult::Busy;
                 }
             }
 
@@ -110,7 +102,7 @@ namespace NActors::NWorkStealing {
             pollState.NextStealAtIdle = pollState.ConsecutiveIdle + pollState.StealInterval;
         }
 
-        // Step 4: Nothing found anywhere
+        // Step 3: Nothing found anywhere
         slot.Counters.IdlePolls.fetch_add(1, std::memory_order_relaxed);
         return EPollResult::Idle;
     }

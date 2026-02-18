@@ -71,7 +71,7 @@ namespace NActors::NWorkStealing {
             Sleep(TDuration::MilliSeconds(50));
 
             // Inject an activation and wake the worker (it may have parked)
-            UNIT_ASSERT(slot.Inject(42));
+            slot.Push(42);
             driver.WakeSlot(&slot);
 
             // Wait for worker to process it
@@ -203,7 +203,7 @@ namespace NActors::NWorkStealing {
             Sleep(TDuration::MilliSeconds(100));
 
             // Inject work and wake the driver
-            UNIT_ASSERT(slot.Inject(99));
+            slot.Push(99);
             driver.WakeSlot(&slot);
 
             // Wait for the worker to process
