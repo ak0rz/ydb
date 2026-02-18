@@ -21,6 +21,7 @@ SRCS(
     executor_pool_ws_integration_ut.cpp
     executor_pool_ws_ut.cpp
     harmonizer_adapter_ut.cpp
+    mpmc_unbounded_queue_ut.cpp
     thread_driver_ut.cpp
     topology_ut.cpp
     ws_executor_context_ut.cpp
