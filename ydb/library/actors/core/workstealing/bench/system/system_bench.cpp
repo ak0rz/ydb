@@ -285,6 +285,37 @@ namespace {
     };
 
     // -------------------------------------------------------------------
+    // Reincarnation actors
+    // -------------------------------------------------------------------
+
+    class TReincarnationActor: public NActors::TActor<TReincarnationActor> {
+    public:
+        TReincarnationActor(std::atomic<ui64>& counter, std::atomic<bool>& stop)
+            : TActor(&TReincarnationActor::StateFunc)
+            , Counter_(counter)
+            , Stop_(stop)
+        {
+        }
+
+        STFUNC(StateFunc) {
+            Y_UNUSED(ev);
+            Counter_.fetch_add(1, std::memory_order_relaxed);
+            if (Stop_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            // Register a fresh actor, send it a message, then die
+            auto* next = new TReincarnationActor(Counter_, Stop_);
+            NActors::TActorId nextId = Register(next);
+            Send(nextId, new TEvBenchMsg());
+            PassAway();
+        }
+
+    private:
+        std::atomic<ui64>& Counter_;
+        std::atomic<bool>& Stop_;
+    };
+
+    // -------------------------------------------------------------------
     // Benchmark result
     // -------------------------------------------------------------------
 
@@ -530,6 +561,63 @@ namespace {
         };
     }
 
+    TBenchResult RunReincarnation(const TString& poolType, ui32 threads, ui32 actors,
+                                  ui32 warmupSec, ui32 durationSec) {
+        auto setup = (poolType == "ws") ? MakeWSSetup(threads, GSpinThresholdCycles) : MakeBasicSetup(threads);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = BenchPoolId(poolType);
+
+        std::atomic<ui64> counter{0};
+        std::atomic<bool> stop{false};
+
+        // Seed N independent reincarnation chains
+        for (ui32 i = 0; i < actors; ++i) {
+            auto* actor = new TReincarnationActor(counter, stop);
+            NActors::TActorId id = sys.Register(actor, NActors::TMailboxType::HTSwap, pool);
+            sys.Send(id, new TEvBenchMsg());
+        }
+
+        // Warmup
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        counter.store(0, std::memory_order_relaxed);
+        ResetWsCounters();
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+
+        ui64 ops = counter.load(std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+
+        double opsPerSec = (elapsed > 0) ? (double)ops / elapsed : 0;
+        double avgLatencyUs = (ops > 0) ? (elapsed * 1e6 / ops) : 0;
+
+        char label[128];
+        std::snprintf(label, sizeof(label), "%s/reincarnation t=%u p=%u", poolType.c_str(), threads, actors);
+        DumpWsCounters(label);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        sys.Stop();
+
+        return TBenchResult{
+            .PoolType = poolType,
+            .Scenario = "reincarnation",
+            .Threads = threads,
+            .ActorPairs = actors,
+            .OpsPerSec = opsPerSec,
+            .AvgLatencyUs = avgLatencyUs,
+            .CpuSeconds = cpuAfter - cpuBefore,
+            .WallSeconds = elapsed,
+        };
+    }
+
 } // anonymous namespace
 
 int main(int argc, const char* argv[]) {
@@ -542,7 +630,7 @@ int main(int argc, const char* argv[]) {
         .StoreResult(&poolType);
 
     TString scenario = "all";
-    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, or all")
+    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -593,7 +681,7 @@ int main(int argc, const char* argv[]) {
 
     std::vector<TString> scenarios;
     if (scenario == "all") {
-        scenarios = {"ping-pong", "star", "chain"};
+        scenarios = {"ping-pong", "star", "chain", "reincarnation"};
     } else {
         scenarios = {scenario};
     }
@@ -612,6 +700,8 @@ int main(int argc, const char* argv[]) {
                         result = RunStar(pt, t, p, warmupSec, durationSec);
                     } else if (sc == "chain") {
                         result = RunChain(pt, t, p, warmupSec, durationSec);
+                    } else if (sc == "reincarnation") {
+                        result = RunReincarnation(pt, t, p, warmupSec, durationSec);
                     }
                     result.PrintCSV();
                     std::fflush(stdout);
