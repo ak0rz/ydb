@@ -48,9 +48,9 @@ namespace NActors::NWorkStealing {
     //
     // Algorithm:
     // 1. Pop activations from our MPMC queue
-    //    - Call executeCallback(hint) — processes one event
-    //    - If callback returns true (more events): push hint back
-    //    - Budget (MaxExecBatch) is per-event, checked AFTER execution
+    //    - Process events from each mailbox for up to MailboxBatchCycles
+    //    - If callback returns true after time budget: push hint back
+    //    - Overall budget (MaxExecBatch) is per-event, checked each iteration
     //    - Return Busy if any work was done
     // 2. No local work: try stealing from neighbors via stealIterator
     //    - StealHalf into stack buffer, push stolen items into our queue

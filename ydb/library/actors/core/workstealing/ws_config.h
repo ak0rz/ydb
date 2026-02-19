@@ -6,7 +6,8 @@
 namespace NActors::NWorkStealing {
 
     struct TWsConfig {
-        size_t MaxExecBatch = 64;             // max activations to execute per PollSlot call
+        size_t MaxExecBatch = 64;             // max events to execute per PollSlot call
+        uint64_t MailboxBatchCycles = 50000;    // max cycles per mailbox before push-back (~17us at 3GHz)
         uint64_t SpinThresholdCycles = 100000;  // max spin cycles before parking (~33us at 3GHz)
         uint64_t MinSpinThresholdCycles = 10000; // initial spin after wake (~3us at 3GHz)
         uint64_t LoadWindowNs = 1000000;      // 1ms -- load estimate window

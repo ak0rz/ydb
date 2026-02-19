@@ -1,6 +1,38 @@
 #include "ws_poll.h"
+#include "ws_counters.h"
+
+#include <ydb/library/actors/util/datetime.h>
 
 namespace NActors::NWorkStealing {
+
+    namespace {
+        // Execute events from one mailbox until the time budget expires
+        // or the mailbox is drained. Returns true if the mailbox still
+        // has events (caller should push back).
+        bool ExecuteBatch(
+            const TExecuteCallback& executeCallback,
+            ui32 activation,
+            uint64_t deadlineCycles,
+            size_t& execBudget,
+            bool& didWork,
+            TWsSlotCounters& counters)
+        {
+            bool hasMore = false;
+            while (execBudget > 0) {
+                hasMore = executeCallback(activation);
+                if (!hasMore) {
+                    break;
+                }
+                didWork = true;
+                --execBudget;
+                counters.Executions.fetch_add(1, std::memory_order_relaxed);
+                if (GetCycleCountFast() >= deadlineCycles) {
+                    break;
+                }
+            }
+            return hasMore;
+        }
+    } // anonymous namespace
 
     EPollResult PollSlot(
         TSlot& slot,
@@ -12,10 +44,10 @@ namespace NActors::NWorkStealing {
         bool didWork = false;
         size_t execBudget = config.MaxExecBatch;
 
-        // Step 1: Pop and execute from our queue, one event at a time.
-        // After each event, push the activation back if it has more events.
-        // This interleaves activations from different mailboxes, preventing
-        // starvation when an actor sends to itself.
+        // Step 1: Pop and execute from our queue.
+        // Process events from each mailbox for up to MailboxBatchCycles
+        // before push-back. This amortizes MPMC queue overhead for hot
+        // mailboxes while still interleaving activations.
         while (execBudget > 0) {
             auto activation = slot.Pop();
             if (!activation) {
@@ -23,16 +55,15 @@ namespace NActors::NWorkStealing {
             }
 
             slot.Executing.store(true, std::memory_order_release);
-            bool hasMore = executeCallback(*activation);
+            uint64_t deadline = GetCycleCountFast() + config.MailboxBatchCycles;
+            bool hasMore = ExecuteBatch(
+                executeCallback, *activation, deadline,
+                execBudget, didWork, slot.Counters);
             slot.Executing.store(false, std::memory_order_release);
 
             if (hasMore) {
-                didWork = true;
-                --execBudget;
-                slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
                 slot.Push(*activation);
             }
-            // If !hasMore: activation finalized (mailbox unlocked), no pushback.
         }
 
         if (didWork) {
@@ -76,7 +107,7 @@ namespace NActors::NWorkStealing {
                     slot.Push(stealBuf[i]);
                 }
 
-                // Execute stolen items with same single-event model
+                // Execute stolen items with same batched model
                 while (execBudget > 0) {
                     auto activation = slot.Pop();
                     if (!activation) {
@@ -84,13 +115,13 @@ namespace NActors::NWorkStealing {
                     }
 
                     slot.Executing.store(true, std::memory_order_release);
-                    bool hasMore = executeCallback(*activation);
+                    uint64_t deadline = GetCycleCountFast() + config.MailboxBatchCycles;
+                    bool hasMore = ExecuteBatch(
+                        executeCallback, *activation, deadline,
+                        execBudget, didWork, slot.Counters);
                     slot.Executing.store(false, std::memory_order_release);
 
                     if (hasMore) {
-                        didWork = true;
-                        --execBudget;
-                        slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
                         slot.Push(*activation);
                     }
                 }
