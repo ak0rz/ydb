@@ -40,9 +40,16 @@ namespace NActors::NWorkStealing {
         // Must be called once at thread end.
         void ClearTLS();
 
-        // Execute a mailbox. The mailbox must already be locked.
-        // Returns true if budget was depleted (mailbox still has events).
-        bool ExecuteMailbox(TMailbox* mailbox);
+        // Execute a single event from the mailbox.
+        // Returns true if an event was processed (more might remain).
+        // Returns false if no event was available (Pop() returned nullptr).
+        // Does NOT finalize the mailbox — caller must call FinishMailbox
+        // when ExecuteSingleEvent returns false.
+        bool ExecuteSingleEvent(TMailbox* mailbox);
+
+        // Finalize the mailbox after the last ExecuteSingleEvent returns false.
+        // Unlocks or frees the mailbox as appropriate.
+        void FinishMailbox(TMailbox* mailbox);
 
         // Do NOT start the thread.
         // TThread::Start() is never called.

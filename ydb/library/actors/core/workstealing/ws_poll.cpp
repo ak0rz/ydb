@@ -12,20 +12,27 @@ namespace NActors::NWorkStealing {
         bool didWork = false;
         size_t execBudget = config.MaxExecBatch;
 
-        // Step 1: Pop and execute from our queue.
+        // Step 1: Pop and execute from our queue, one event at a time.
+        // After each event, push the activation back if it has more events.
+        // This interleaves activations from different mailboxes, preventing
+        // starvation when an actor sends to itself.
         while (execBudget > 0) {
             auto activation = slot.Pop();
             if (!activation) {
                 break;
             }
-            didWork = true;
-            --execBudget;
-            slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
 
-            bool budgetDepleted = executeCallback(*activation);
-            if (budgetDepleted) {
+            slot.Executing.store(true, std::memory_order_release);
+            bool hasMore = executeCallback(*activation);
+            slot.Executing.store(false, std::memory_order_release);
+
+            if (hasMore) {
+                didWork = true;
+                --execBudget;
+                slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
                 slot.Push(*activation);
             }
+            // If !hasMore: activation finalized (mailbox unlocked), no pushback.
         }
 
         if (didWork) {
@@ -53,35 +60,37 @@ namespace NActors::NWorkStealing {
 
             stealIterator->Reset();
             while (TSlot* victim = stealIterator->Next()) {
-                if (victim->SizeEstimate() == 0) {
+                if (victim->SizeEstimate() == 0 ||
+                    !victim->Executing.load(std::memory_order_acquire)) {
                     continue;
                 }
                 slot.Counters.StealAttempts.fetch_add(1, std::memory_order_relaxed);
 
-                // Tight pop loop: pull from victim into stack buffer
                 size_t stolen = victim->StealHalf(stealBuf, kStealBufSize);
                 if (stolen == 0) {
                     continue;
                 }
                 slot.Counters.StolenItems.fetch_add(stolen, std::memory_order_relaxed);
 
-                // Tight push loop: transfer buffer into our queue
                 for (size_t i = 0; i < stolen; ++i) {
                     slot.Push(stealBuf[i]);
                 }
 
-                // Execute from our queue
+                // Execute stolen items with same single-event model
                 while (execBudget > 0) {
                     auto activation = slot.Pop();
                     if (!activation) {
                         break;
                     }
-                    didWork = true;
-                    --execBudget;
-                    slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
 
-                    bool budgetDepleted = executeCallback(*activation);
-                    if (budgetDepleted) {
+                    slot.Executing.store(true, std::memory_order_release);
+                    bool hasMore = executeCallback(*activation);
+                    slot.Executing.store(false, std::memory_order_release);
+
+                    if (hasMore) {
+                        didWork = true;
+                        --execBudget;
+                        slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
                         slot.Push(*activation);
                     }
                 }

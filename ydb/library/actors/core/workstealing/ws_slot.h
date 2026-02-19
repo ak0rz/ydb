@@ -2,16 +2,13 @@
 
 #include "ws_counters.h"
 
+#include "mpmc_unbounded_queue.h"
+
 #include <util/system/types.h>
 
 #include <atomic>
 #include <cstdint>
-#include <memory>
 #include <optional>
-
-namespace NActors {
-    class TRingActivationQueueV4;
-}
 
 namespace NActors::NWorkStealing {
 
@@ -31,7 +28,7 @@ namespace NActors::NWorkStealing {
 
     // Scheduling slot for the work-stealing runtime.
     //
-    // Each slot owns a single MPMC activation queue (TRingActivationQueueV4).
+    // Each slot owns a TMPMCUnboundedQueue for activations.
     // Any thread can Push/Pop activations; StealHalf pops a batch for stealers.
     //
     // State machine:
@@ -71,6 +68,7 @@ namespace NActors::NWorkStealing {
         // --- Driver integration ---
 
         std::atomic<bool> WorkerSpinning{false};
+        std::atomic<bool> Executing{false};   // true while inside executeCallback
         void* DriverData = nullptr;
 
         // --- Stats ---
@@ -82,8 +80,7 @@ namespace NActors::NWorkStealing {
     private:
         std::atomic<ESlotState> State_{ESlotState::Inactive};
 
-        std::unique_ptr<NActors::TRingActivationQueueV4> Queue_;
-        alignas(64) std::atomic<ui64> PopCounter_{0};
+        TMPMCUnboundedQueue<65536> Queue_;
         alignas(64) std::atomic<i64> ApproxSize_{0};
 
         static bool IsValidTransition(ESlotState from, ESlotState to);

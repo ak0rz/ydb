@@ -1,18 +1,12 @@
 #include "ws_slot.h"
 
-#include <ydb/library/actors/core/thread_context.h>
-#include <ydb/library/actors/queues/activation_queue.h>
-
 #include <util/system/yassert.h>
 
 #include <algorithm>
 
 namespace NActors::NWorkStealing {
 
-    TSlot::TSlot()
-        : Queue_(std::make_unique<NActors::TRingActivationQueueV4>(8))
-    {
-    }
+    TSlot::TSlot() = default;
 
     TSlot::~TSlot() = default;
 
@@ -43,14 +37,13 @@ namespace NActors::NWorkStealing {
     }
 
     void TSlot::Push(ui32 hint) {
-        Queue_->Push(hint, 0);
+        Queue_.Push(hint);
         ApproxSize_.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::optional<ui32> TSlot::Pop() {
-        ui64 counter = PopCounter_.fetch_add(1, std::memory_order_relaxed);
-        ui32 result = Queue_->Pop(counter);
-        if (result == 0) {
+        auto result = Queue_.TryPop();
+        if (!result) {
             return std::nullopt;
         }
         ApproxSize_.fetch_sub(1, std::memory_order_relaxed);
@@ -66,13 +59,12 @@ namespace NActors::NWorkStealing {
         size_t target = std::min(std::max(estimate / 2, size_t(1)), max);
         size_t count = 0;
         while (count < target) {
-            ui64 counter = PopCounter_.fetch_add(1, std::memory_order_relaxed);
-            ui32 item = Queue_->Pop(counter);
-            if (item == 0) {
+            auto item = Queue_.TryPop();
+            if (!item) {
                 break;
             }
             ApproxSize_.fetch_sub(1, std::memory_order_relaxed);
-            out[count++] = item;
+            out[count++] = *item;
         }
         return count;
     }

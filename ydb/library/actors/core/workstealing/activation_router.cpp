@@ -15,12 +15,26 @@ namespace NActors::NWorkStealing {
             return -1;
         }
 
-        // Sticky routing: try the last slot that executed this mailbox
+        // Sticky routing: try the last slot that executed this mailbox,
+        // but only if it isn't overloaded (queue depth ≤ 2× a random peer).
+        // This preserves cache locality while letting work spread when load
+        // is unbalanced (e.g., 10 actor pairs on 32 slots).
         if (lastSlotIdx > 0 && lastSlotIdx <= activeCount) {
             size_t idx = lastSlotIdx - 1;
             if (Slots_[idx].GetState() == ESlotState::Active) {
-                Slots_[idx].Push(hint);
-                return static_cast<int>(idx);
+                size_t stickyLoad = Slots_[idx].SizeEstimate();
+                if (stickyLoad <= 1) {
+                    // Slot is empty or near-empty — always use it.
+                    Slots_[idx].Push(hint);
+                    return static_cast<int>(idx);
+                }
+                // Compare with a hash-derived peer.
+                size_t peer = (hint ^ 0x9e3779b9u) % activeCount;
+                size_t peerLoad = Slots_[peer].SizeEstimate();
+                if (stickyLoad <= peerLoad * 2 + 2) {
+                    Slots_[idx].Push(hint);
+                    return static_cast<int>(idx);
+                }
             }
         }
 

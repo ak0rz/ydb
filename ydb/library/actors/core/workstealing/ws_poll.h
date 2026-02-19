@@ -29,10 +29,10 @@ namespace NActors::NWorkStealing {
         virtual void Reset() = 0;
     };
 
-    // Callback type for executing a mailbox activation.
+    // Callback type for executing a single event from a mailbox activation.
     // Called with the activation hint (mailbox index).
-    // Returns true if the mailbox still has pending events (budget depleted),
-    // false if the mailbox is empty after execution.
+    // Returns true if an event was processed (more events might remain).
+    // Returns false if no event was available (mailbox was finalized).
     using TExecuteCallback = std::function<bool(ui32 hint)>;
 
     // Per-slot state for polling. Tracks consecutive idle polls to
@@ -47,13 +47,14 @@ namespace NActors::NWorkStealing {
     // Core polling routine for a single slot.
     //
     // Algorithm:
-    // 1. Pop and execute from our MPMC queue (up to config.MaxExecBatch)
-    //    - For each: call executeCallback(hint)
-    //    - If callback returns true (budget depleted): push hint back
+    // 1. Pop activations from our MPMC queue
+    //    - Call executeCallback(hint) — processes one event
+    //    - If callback returns true (more events): push hint back
+    //    - Budget (MaxExecBatch) is per-event, checked AFTER execution
     //    - Return Busy if any work was done
     // 2. No local work: try stealing from neighbors via stealIterator
     //    - StealHalf into stack buffer, push stolen items into our queue
-    //    - Execute stolen items (up to remaining budget)
+    //    - Execute with same single-event model
     //    - Return Busy if any work was done
     // 3. Nothing found anywhere: return Idle
     EPollResult PollSlot(

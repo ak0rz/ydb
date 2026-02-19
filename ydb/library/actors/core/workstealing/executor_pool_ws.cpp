@@ -77,32 +77,41 @@ namespace NActors::NWorkStealing {
             for (i16 i = 0; i < MaxSlotCount_; ++i) {
                 auto* ctx = Contexts_[i].get();
                 TWorkerCallbacks callbacks;
-                callbacks.Execute = [ctx, mboxTable, pool](ui32 hint) -> bool {
+                i16 slotIdx = i;
+                callbacks.Execute = [ctx, mboxTable, pool, slotIdx](ui32 hint) -> bool {
                     TMailbox* mailbox = mboxTable->Get(hint);
                     if (!mailbox) {
                         return false;
                     }
-                    // Guard: skip if mailbox is already unlocked or free.
-                    // MarkerUnlocked=1, MarkerFree=2 (private constants in TMailbox).
-                    uintptr_t nep = mailbox->NextEventPtr.load(std::memory_order_acquire);
-                    if (nep == 1 || nep == 2) {
+
+                    CurrentlyExecutingMailbox = mailbox;
+                    DeferredReinjection = nullptr;
+
+                    bool processed = ctx->ExecuteSingleEvent(mailbox);
+
+                    // Stamp affinity BEFORE any unlock — after unlock another
+                    // thread may read LastPoolSlotIdx via RouteActivation.
+                    mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
+
+                    if (!processed) {
+                        // No event available. Finalize (unlock/free) the mailbox.
+                        ctx->FinishMailbox(mailbox);
+                        CurrentlyExecutingMailbox = nullptr;
+
+                        // Process deferred re-activation from Unlock path.
+                        if (DeferredReinjection) {
+                            TMailbox* deferred = DeferredReinjection;
+                            DeferredReinjection = nullptr;
+                            pool->RouteActivation(deferred);
+                        }
                         return false;
                     }
 
-                    // Execute with deferred re-injection for THIS mailbox only.
-                    // Other mailboxes activated by Send during Receive are routed immediately.
-                    CurrentlyExecutingMailbox = mailbox;
-                    DeferredReinjection = nullptr;
-                    ctx->ExecuteMailbox(mailbox);
+                    // Event processed, mailbox stays locked for more.
+                    mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
                     CurrentlyExecutingMailbox = nullptr;
-
-                    // Process deferred re-activation from Unlock path.
-                    if (DeferredReinjection) {
-                        TMailbox* deferred = DeferredReinjection;
-                        DeferredReinjection = nullptr;
-                        pool->RouteActivation(deferred);
-                    }
-                    return false;
+                    DeferredReinjection = nullptr;
+                    return true;
                 };
                 callbacks.Setup = [ctx]() {
                     ctx->SetupTLS();

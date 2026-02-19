@@ -447,6 +447,10 @@ namespace NActors::NWorkStealing {
             std::latch start(NumStealers + 1);
 
             std::vector<std::vector<ui32>> stealerResults(NumStealers);
+            std::vector<std::atomic<size_t>> stealerCounts(NumStealers);
+            for (size_t s = 0; s < NumStealers; ++s) {
+                stealerCounts[s].store(0, std::memory_order_relaxed);
+            }
             std::vector<std::thread> stealers;
             stealers.reserve(NumStealers);
             for (size_t s = 0; s < NumStealers; ++s) {
@@ -458,6 +462,7 @@ namespace NActors::NWorkStealing {
                         for (size_t i = 0; i < n; ++i) {
                             stealerResults[s].push_back(buf[i]);
                         }
+                        stealerCounts[s].store(stealerResults[s].size(), std::memory_order_release);
                     }
                     // Final passes
                     for (int pass = 0; pass < 5; ++pass) {
@@ -491,7 +496,7 @@ namespace NActors::NWorkStealing {
                 }
                 size_t totalStolen = 0;
                 for (size_t s = 0; s < NumStealers; ++s) {
-                    totalStolen += stealerResults[s].size();
+                    totalStolen += stealerCounts[s].load(std::memory_order_acquire);
                 }
                 if (ownerResults.size() + totalStolen >= NumItems) {
                     break;

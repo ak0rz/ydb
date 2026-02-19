@@ -2,6 +2,7 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 
+#include <map>
 #include <vector>
 
 namespace NActors::NWorkStealing {
@@ -39,6 +40,24 @@ namespace NActors::NWorkStealing {
             size_t Pos_;
         };
 
+        // Create a callback that simulates N events per hint.
+        // First N calls per hint return true (event processed),
+        // then false (mailbox empty/finalized).
+        TExecuteCallback MakeCallback(
+            std::vector<ui32>& executed,
+            std::map<ui32, ui32>& remaining)
+        {
+            return [&](ui32 hint) -> bool {
+                auto it = remaining.find(hint);
+                if (it == remaining.end() || it->second == 0) {
+                    return false; // no events
+                }
+                executed.push_back(hint);
+                --it->second;
+                return true; // event processed
+            };
+        }
+
     } // anonymous namespace
 
     Y_UNIT_TEST_SUITE(WsPoll) {
@@ -49,21 +68,18 @@ namespace NActors::NWorkStealing {
 
             slot.Push(42);
 
-            ui32 received = 0;
-            bool callbackCalled = false;
-            TExecuteCallback cb = [&](ui32 hint) -> bool {
-                callbackCalled = true;
-                received = hint;
-                return false;
-            };
+            // Simulate mailbox with 1 event.
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{42, 1}};
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             TPollState ps;
             EPollResult result = PollSlot(slot, nullptr, cb, config, ps);
 
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
-            UNIT_ASSERT(callbackCalled);
-            UNIT_ASSERT_VALUES_EQUAL(received, 42u);
+            UNIT_ASSERT_VALUES_EQUAL(executed.size(), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(executed[0], 42u);
         }
 
         Y_UNIT_TEST(EmptySlotReturnsIdle) {
@@ -84,14 +100,18 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT(!callbackCalled);
         }
 
-        Y_UNIT_TEST(ExecuteCallbackBudgetDepleted) {
+        Y_UNIT_TEST(SingleEventPushBack) {
+            // When the callback returns true (more events), the activation
+            // is pushed back into the queue for interleaved processing.
             TSlot slot;
             ActivateSlot(slot);
 
             slot.Push(7);
 
+            ui32 callCount = 0;
             TExecuteCallback cb = [&](ui32) -> bool {
-                return true; // budget depleted
+                ++callCount;
+                return callCount < 3; // 3 events total
             };
 
             TWsConfig config;
@@ -99,11 +119,70 @@ namespace NActors::NWorkStealing {
             EPollResult result = PollSlot(slot, nullptr, cb, config, ps);
 
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
+            UNIT_ASSERT_VALUES_EQUAL(callCount, 3u);
 
-            // The activation should have been reinjected.
+            // After all events are processed, the slot queue should be empty
+            auto item = slot.Pop();
+            UNIT_ASSERT(!item.has_value());
+        }
+
+        Y_UNIT_TEST(BudgetExhaustedLeavesWorkInQueue) {
+            // With MaxExecBatch=2 and 5 events, PollSlot processes 2
+            // and leaves the activation in the queue.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            slot.Push(7);
+
+            ui32 callCount = 0;
+            TExecuteCallback cb = [&](ui32) -> bool {
+                ++callCount;
+                return true; // always more events
+            };
+
+            TWsConfig config;
+            config.MaxExecBatch = 2;
+            TPollState ps;
+            EPollResult result = PollSlot(slot, nullptr, cb, config, ps);
+
+            UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
+            UNIT_ASSERT_VALUES_EQUAL(callCount, 2u);
+
+            // The activation should still be in the queue (pushed back)
             auto item = slot.Pop();
             UNIT_ASSERT(item.has_value());
             UNIT_ASSERT_VALUES_EQUAL(*item, 7u);
+        }
+
+        Y_UNIT_TEST(InterleavedActivations) {
+            // Two activations in the queue. With single-event processing
+            // and pushback, they get interleaved.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            slot.Push(1);
+            slot.Push(2);
+
+            std::vector<ui32> order;
+            std::map<ui32, ui32> remaining = {{1, 2}, {2, 2}};
+            auto cb = MakeCallback(order, remaining);
+
+            TWsConfig config;
+            TPollState ps;
+            EPollResult result = PollSlot(slot, nullptr, cb, config, ps);
+
+            UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
+            // Both activations should be fully processed
+            UNIT_ASSERT_VALUES_EQUAL(order.size(), 4u);
+            // They should be interleaved (not all of 1 first, then all of 2)
+            // The exact order depends on queue FIFO behavior, but both should appear
+            ui32 count1 = 0, count2 = 0;
+            for (ui32 h : order) {
+                if (h == 1) ++count1;
+                if (h == 2) ++count2;
+            }
+            UNIT_ASSERT_VALUES_EQUAL(count1, 2u);
+            UNIT_ASSERT_VALUES_EQUAL(count2, 2u);
         }
 
         Y_UNIT_TEST(ExecuteCallbackCompleted) {
@@ -112,9 +191,10 @@ namespace NActors::NWorkStealing {
 
             slot.Push(7);
 
-            TExecuteCallback cb = [&](ui32) -> bool {
-                return false; // mailbox empty, done
-            };
+            // 1 event per activation
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{7, 1}};
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             TPollState ps;
@@ -134,19 +214,22 @@ namespace NActors::NWorkStealing {
             TSlot slotB;
             ActivateSlot(slotB);
 
-            // Put work into slotB
+            // Put work into slotB and mark it as executing
             for (ui32 i = 0; i < 10; ++i) {
                 slotB.Push(100 + i);
             }
+            slotB.Executing.store(true, std::memory_order_relaxed);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);
 
-            ui32 received = 0;
-            TExecuteCallback cb = [&](ui32 hint) -> bool {
-                received = hint;
-                return false;
-            };
+            // Each stolen hint has 1 event
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining;
+            for (ui32 i = 0; i < 10; ++i) {
+                remaining[100 + i] = 1;
+            }
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             config.StarvationGuardLimit = 1; // steal on first idle
@@ -154,8 +237,11 @@ namespace NActors::NWorkStealing {
             EPollResult result = PollSlot(slotA, &iter, cb, config, ps);
 
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
-            // Callback must have been called with one of the stolen hints
-            UNIT_ASSERT(received >= 100 && received < 110);
+            // Callback must have been called with stolen hints
+            UNIT_ASSERT(!executed.empty());
+            for (ui32 hint : executed) {
+                UNIT_ASSERT(hint >= 100 && hint < 110);
+            }
         }
 
         Y_UNIT_TEST(StealIteratorExhausted) {
@@ -185,16 +271,17 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             ActivateSlot(slot);
 
-            // Inject multiple items (1-based: 0 means "empty" in MPMC queue)
+            // Inject 5 items — each represents a mailbox with 1 event
             for (ui32 i = 0; i < 5; ++i) {
                 slot.Push(i + 1);
             }
 
             std::vector<ui32> executed;
-            TExecuteCallback cb = [&](ui32 hint) -> bool {
-                executed.push_back(hint);
-                return false;
-            };
+            std::map<ui32, ui32> remaining;
+            for (ui32 i = 0; i < 5; ++i) {
+                remaining[i + 1] = 1;
+            }
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             TPollState ps;
@@ -222,19 +309,22 @@ namespace NActors::NWorkStealing {
             TSlot slotB;
             ActivateSlot(slotB);
 
-            // Put multiple items into slotB
+            // Put multiple items into slotB and mark it as executing
             for (ui32 i = 0; i < 6; ++i) {
                 slotB.Push(200 + i);
             }
+            slotB.Executing.store(true, std::memory_order_relaxed);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);
 
+            // Each stolen hint has 1 event
             std::vector<ui32> executed;
-            TExecuteCallback cb = [&](ui32 hint) -> bool {
-                executed.push_back(hint);
-                return false;
-            };
+            std::map<ui32, ui32> remaining;
+            for (ui32 i = 0; i < 6; ++i) {
+                remaining[200 + i] = 1;
+            }
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             config.StarvationGuardLimit = 1; // steal on first idle
@@ -279,11 +369,18 @@ namespace NActors::NWorkStealing {
             for (ui32 i = 0; i < 10; ++i) {
                 slotB.Push(300 + i);
             }
+            slotB.Executing.store(true, std::memory_order_relaxed);
 
             std::vector<TSlot*> neighbors = {&slotB};
             TTestStealIterator iter(neighbors);
 
-            TExecuteCallback cb = [&](ui32) -> bool { return false; };
+            // Each hint has 1 event
+            std::map<ui32, ui32> remaining;
+            for (ui32 i = 0; i < 10; ++i) {
+                remaining[300 + i] = 1;
+            }
+            std::vector<ui32> executed;
+            auto cb = MakeCallback(executed, remaining);
 
             TWsConfig config;
             config.StarvationGuardLimit = 3; // default: steal every 3rd idle poll
