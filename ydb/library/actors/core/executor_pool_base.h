@@ -14,10 +14,14 @@
 namespace NActors {
     class TActorSystem;
 
+    struct TMailboxTableDeleter {
+        static void Destroy(TMailboxTable* p) noexcept;
+    };
+
     class TExecutorPoolBaseMailboxed: public IExecutorPool {
     protected:
         TActorSystem* ActorSystem;
-        THolder<TMailboxTable> MailboxTableHolder;
+        THolder<TMailboxTable, TMailboxTableDeleter> MailboxTableHolder;
         TMailboxTable* MailboxTable;
 #ifdef ACTORSLIB_COLLECT_EXEC_STATS
         // Need to have per pool object to collect stats like actor registrations (because

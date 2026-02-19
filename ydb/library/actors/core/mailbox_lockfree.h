@@ -261,8 +261,11 @@ namespace NActors {
         static constexpr ui32 MailboxIndexMask = 0xFFFu;
 
     public:
-        TMailboxTable();
+        explicit TMailboxTable(size_t slabSize = 0);
         ~TMailboxTable();
+
+        static TMailboxTable* Create();
+        static void Destroy(TMailboxTable* table) noexcept;
 
         bool Cleanup() noexcept;
 
@@ -283,6 +286,10 @@ namespace NActors {
         void FreeFullBlock(TMailbox*) noexcept;
         TMailbox* AllocateFullBlockLocked();
 
+        void* SlabAllocate(size_t size, size_t alignment);
+        void* AllocateNewSlab();
+        static size_t DetectHugePageSize();
+
     private:
         struct alignas(4096) TMailboxLine {
             TMailbox Mailboxes[MailboxesPerLine];
@@ -290,6 +297,11 @@ namespace NActors {
 
         struct alignas(4096) TMailboxStatLine {
             TMailboxExecStats Stats[MailboxesPerLine];
+        };
+
+        struct TSlabHeader {
+            void* Next;
+            size_t Size;
         };
 
     private:
@@ -307,6 +319,13 @@ namespace NActors {
 
         // Parallel array of per-mailbox execution/idle stats (allocated alongside Lines)
         std::atomic<TMailboxStatLine*> StatLines[LinesCount] = { { nullptr } };
+
+        // Slab allocator for hugepage support
+        size_t SlabSize_{0};
+        void* NextSlab_{nullptr};
+        char* SlabCursor_{nullptr};
+        size_t SlabRemaining_{0};
+        size_t FirstHeapLineIndex_{Max<size_t>()};
     };
 
     static_assert(sizeof(TMailboxTable) <= 2097152, "TMailboxTable is too large");

@@ -2,6 +2,15 @@
 #include "actor.h"
 #include "executor_pool.h"
 
+#include <new>
+
+#if defined(_linux_)
+#include <sys/mman.h>
+#include <dirent.h>
+#include <cstdlib>
+#include <cstring>
+#endif
+
 namespace NActors {
 
     namespace {
@@ -670,18 +679,164 @@ namespace NActors {
         CurrentSize++;
     }
 
-    TMailboxTable::TMailboxTable() {}
+    size_t TMailboxTable::DetectHugePageSize() {
+#if defined(_linux_)
+        DIR* dir = opendir("/sys/kernel/mm/hugepages");
+        if (!dir) {
+            return 0;
+        }
+        size_t smallest = 0;
+        while (auto* entry = readdir(dir)) {
+            const char* name = entry->d_name;
+            if (std::strncmp(name, "hugepages-", 10) != 0) {
+                continue;
+            }
+            char* end = nullptr;
+            unsigned long kB = std::strtoul(name + 10, &end, 10);
+            if (end == name + 10 || std::strcmp(end, "kB") != 0 || kB == 0) {
+                continue;
+            }
+            size_t bytes = static_cast<size_t>(kB) * 1024;
+            if (smallest == 0 || bytes < smallest) {
+                smallest = bytes;
+            }
+        }
+        closedir(dir);
+        return smallest;
+#else
+        return 0;
+#endif
+    }
+
+    TMailboxTable* TMailboxTable::Create() {
+#if defined(_linux_)
+        size_t hugePageSize = DetectHugePageSize();
+        if (hugePageSize > 0 && hugePageSize >= sizeof(TMailboxTable)) {
+            int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE;
+            flags |= static_cast<int>(__builtin_ctzll(hugePageSize) << MAP_HUGE_SHIFT);
+            void* mem = ::mmap(nullptr, hugePageSize, PROT_READ | PROT_WRITE, flags, -1, 0);
+            if (mem != MAP_FAILED) {
+                return new (mem) TMailboxTable(hugePageSize);
+            }
+        }
+#endif
+        return new TMailboxTable(0);
+    }
+
+    void TMailboxTable::Destroy(TMailboxTable* table) noexcept {
+        if (!table) {
+            return;
+        }
+#if defined(_linux_)
+        size_t slabSize = table->SlabSize_;
+        table->~TMailboxTable();
+        if (slabSize > 0) {
+            ::munmap(table, slabSize);
+        } else {
+            ::operator delete(table);
+        }
+#else
+        delete table;
+#endif
+    }
+
+    void* TMailboxTable::SlabAllocate(size_t size, size_t alignment) {
+        if (SlabSize_ == 0 || FirstHeapLineIndex_ != Max<size_t>()) {
+            return nullptr;
+        }
+
+        uintptr_t cursor = reinterpret_cast<uintptr_t>(SlabCursor_);
+        uintptr_t aligned = (cursor + alignment - 1) & ~(alignment - 1);
+        size_t padding = static_cast<size_t>(aligned - cursor);
+
+        if (padding + size <= SlabRemaining_) {
+            SlabCursor_ = reinterpret_cast<char*>(aligned + size);
+            SlabRemaining_ -= padding + size;
+            return reinterpret_cast<void*>(aligned);
+        }
+
+        if (AllocateNewSlab()) {
+            cursor = reinterpret_cast<uintptr_t>(SlabCursor_);
+            aligned = (cursor + alignment - 1) & ~(alignment - 1);
+            padding = static_cast<size_t>(aligned - cursor);
+
+            if (padding + size <= SlabRemaining_) {
+                SlabCursor_ = reinterpret_cast<char*>(aligned + size);
+                SlabRemaining_ -= padding + size;
+                return reinterpret_cast<void*>(aligned);
+            }
+        }
+
+        // Hugepage allocation failed, fall back to heap from now on
+        FirstHeapLineIndex_ = AllocatedLines.load(std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    void* TMailboxTable::AllocateNewSlab() {
+#if defined(_linux_)
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE;
+        flags |= static_cast<int>(__builtin_ctzll(SlabSize_) << MAP_HUGE_SHIFT);
+        void* slab = ::mmap(nullptr, SlabSize_, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (slab == MAP_FAILED) {
+            return nullptr;
+        }
+
+        auto* hdr = static_cast<TSlabHeader*>(slab);
+        hdr->Next = NextSlab_;
+        hdr->Size = SlabSize_;
+        NextSlab_ = slab;
+
+        char* headerEnd = reinterpret_cast<char*>(slab) + sizeof(TSlabHeader);
+        uintptr_t aligned = (reinterpret_cast<uintptr_t>(headerEnd) + 4095) & ~uintptr_t(4095);
+        SlabCursor_ = reinterpret_cast<char*>(aligned);
+        SlabRemaining_ = SlabSize_ - static_cast<size_t>(SlabCursor_ - reinterpret_cast<char*>(slab));
+
+        return slab;
+#else
+        return nullptr;
+#endif
+    }
+
+    TMailboxTable::TMailboxTable(size_t slabSize)
+        : SlabSize_(slabSize)
+    {
+        if (slabSize > 0) {
+            char* tableEnd = reinterpret_cast<char*>(this) + sizeof(*this);
+            uintptr_t aligned = (reinterpret_cast<uintptr_t>(tableEnd) + 4095) & ~uintptr_t(4095);
+            SlabCursor_ = reinterpret_cast<char*>(aligned);
+            SlabRemaining_ = slabSize - static_cast<size_t>(SlabCursor_ - reinterpret_cast<char*>(this));
+        }
+    }
 
     TMailboxTable::~TMailboxTable() {
         ui32 lineCount = GetAllocatedLinesCountSlow();
         for (size_t i = 0; i < lineCount; ++i) {
+            bool slabAllocated = (SlabSize_ > 0 && i < FirstHeapLineIndex_);
             if (auto* line = Lines[i].load(std::memory_order_acquire)) {
-                delete line;
+                if (slabAllocated) {
+                    line->~TMailboxLine();
+                } else {
+                    delete line;
+                }
             }
             if (auto* statLine = StatLines[i].load(std::memory_order_acquire)) {
-                delete statLine;
+                if (slabAllocated) {
+                    statLine->~TMailboxStatLine();
+                } else {
+                    delete statLine;
+                }
             }
         }
+#if defined(_linux_)
+        void* slab = NextSlab_;
+        while (slab) {
+            auto* hdr = static_cast<TSlabHeader*>(slab);
+            void* next = hdr->Next;
+            size_t size = hdr->Size;
+            ::munmap(slab, size);
+            slab = next;
+        }
+#endif
     }
 
     bool TMailboxTable::Cleanup() noexcept {
@@ -846,9 +1001,19 @@ namespace NActors {
             static_assert((MailboxesPerLine & (BlockSize - 1)) == 0,
                 "Per line mailboxes are not divisible into blocks");
 
-            // Note: these allocations may throw bad_alloc
-            TMailboxLine* line = new TMailboxLine;
-            TMailboxStatLine* statLine = new TMailboxStatLine;
+            // Prefer slab allocation (hugepages), fall back to heap
+            TMailboxLine* line;
+            TMailboxStatLine* statLine;
+            if (void* mem = SlabAllocate(sizeof(TMailboxLine), alignof(TMailboxLine))) {
+                line = new (mem) TMailboxLine;
+            } else {
+                line = new TMailboxLine;
+            }
+            if (void* mem = SlabAllocate(sizeof(TMailboxStatLine), alignof(TMailboxStatLine))) {
+                statLine = new (mem) TMailboxStatLine;
+            } else {
+                statLine = new TMailboxStatLine;
+            }
 
             TMailbox* head = &line->Mailboxes[0];
             TMailbox* tail = head;

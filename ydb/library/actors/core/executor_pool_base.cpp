@@ -21,10 +21,14 @@ namespace NActors {
         actor->Registered(sys, owner);
     }
 
+    void TMailboxTableDeleter::Destroy(TMailboxTable* p) noexcept {
+        TMailboxTable::Destroy(p);
+    }
+
     TExecutorPoolBaseMailboxed::TExecutorPoolBaseMailboxed(ui32 poolId)
         : IExecutorPool(poolId)
         , ActorSystem(nullptr)
-        , MailboxTableHolder(new TMailboxTable)
+        , MailboxTableHolder(TMailboxTable::Create())
         , MailboxTable(MailboxTableHolder.Get())
     {}
 
