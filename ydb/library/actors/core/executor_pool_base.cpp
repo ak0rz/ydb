@@ -190,6 +190,12 @@ namespace NActors {
         // Free mailboxes are not executing, lock to a normal state
         mailbox->LockFromFree();
 
+        // Stamp initial execution end time so the first event's idle time
+        // is measured from allocation
+        if (auto* execStats = MailboxTable->GetStats(mailbox->Hint)) {
+            execStats->LastExecutionEndCycles.store(GetCycleCountFast(), std::memory_order_relaxed);
+        }
+
         const ui64 localActorId = AllocateID();
         mailbox->AttachActor(localActorId, actor);
 

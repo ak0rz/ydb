@@ -73,6 +73,35 @@ namespace NActors::NWorkStealing {
                 cs->ExecutionCycles.fetch_add(hpnow - hpprev, std::memory_order_relaxed);
             }
 
+            if (auto* mboxStats = ThreadCtx.WorkerContext.MailboxTable->GetStats(mailbox->Hint)) {
+                NHPTimer::STime eventCycles = hpnow - hpprev;
+
+                // Mailbox idle time: from last execution end to start of this event
+                NHPTimer::STime lastEnd = mboxStats->LastExecutionEndCycles.load(std::memory_order_relaxed);
+                if (lastEnd) {
+                    NHPTimer::STime idleCycles = hpprev - lastEnd;
+                    mboxStats->TotalIdleCycles.fetch_add(idleCycles, std::memory_order_relaxed);
+                    auto prevMaxIdle = mboxStats->MaxIdleCycles.load(std::memory_order_relaxed);
+                    if (static_cast<ui64>(idleCycles) > prevMaxIdle)
+                        mboxStats->MaxIdleCycles.store(idleCycles, std::memory_order_relaxed);
+                    auto prevMinIdle = mboxStats->MinIdleCycles.load(std::memory_order_relaxed);
+                    if (static_cast<ui64>(idleCycles) < prevMinIdle)
+                        mboxStats->MinIdleCycles.store(idleCycles, std::memory_order_relaxed);
+                }
+
+                // Execution stats
+                mboxStats->EventsProcessed.fetch_add(1, std::memory_order_relaxed);
+                mboxStats->TotalExecutionCycles.fetch_add(eventCycles, std::memory_order_relaxed);
+                auto prevMax = mboxStats->MaxExecutionCycles.load(std::memory_order_relaxed);
+                if (static_cast<ui64>(eventCycles) > prevMax)
+                    mboxStats->MaxExecutionCycles.store(eventCycles, std::memory_order_relaxed);
+                auto prevMin = mboxStats->MinExecutionCycles.load(std::memory_order_relaxed);
+                if (static_cast<ui64>(eventCycles) < prevMin)
+                    mboxStats->MinExecutionCycles.store(eventCycles, std::memory_order_relaxed);
+
+                mboxStats->LastExecutionEndCycles.store(hpnow, std::memory_order_relaxed);
+            }
+
             if (!DyingActors.empty()) {
                 for (const auto& dying : DyingActors) {
                     if (auto* cs = dying->GetClassStats()) {

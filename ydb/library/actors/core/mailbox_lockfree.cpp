@@ -266,6 +266,17 @@ namespace NActors {
         return std::nullopt;
     }
 
+    void TMailboxExecStats::Reset() noexcept {
+        EventsProcessed.store(0, std::memory_order_relaxed);
+        TotalExecutionCycles.store(0, std::memory_order_relaxed);
+        MaxExecutionCycles.store(0, std::memory_order_relaxed);
+        MinExecutionCycles.store(Max<ui64>(), std::memory_order_relaxed);
+        LastExecutionEndCycles.store(0, std::memory_order_relaxed);
+        TotalIdleCycles.store(0, std::memory_order_relaxed);
+        MaxIdleCycles.store(0, std::memory_order_relaxed);
+        MinIdleCycles.store(Max<ui64>(), std::memory_order_relaxed);
+    }
+
     void TMailbox::CleanupActor(IActor* actor) noexcept {
         actor->DestroyActorTasks();
         delete actor;
@@ -651,6 +662,9 @@ namespace NActors {
             CurrentSize = 0;
         }
 
+        if (auto* stats = Table->GetStats(mailbox->Hint)) {
+            stats->Reset();
+        }
         mailbox->ActorsInfo.Empty.NextFree = CurrentBlock;
         CurrentBlock = mailbox;
         CurrentSize++;
@@ -663,6 +677,9 @@ namespace NActors {
         for (size_t i = 0; i < lineCount; ++i) {
             if (auto* line = Lines[i].load(std::memory_order_acquire)) {
                 delete line;
+            }
+            if (auto* statLine = StatLines[i].load(std::memory_order_acquire)) {
+                delete statLine;
             }
         }
     }
@@ -696,6 +713,17 @@ namespace NActors {
             auto* line = Lines[lineIndex].load(std::memory_order_acquire);
             if (line) [[likely]] {
                 return &line->Mailboxes[hint & MailboxIndexMask];
+            }
+        }
+        return nullptr;
+    }
+
+    TMailboxExecStats* TMailboxTable::GetStats(ui32 hint) const {
+        ui32 lineIndex = (hint >> LineIndexShift) & LineIndexMask;
+        if (lineIndex < LinesCount) [[likely]] {
+            auto* statLine = StatLines[lineIndex].load(std::memory_order_acquire);
+            if (statLine) [[likely]] {
+                return &statLine->Stats[hint & MailboxIndexMask];
             }
         }
         return nullptr;
@@ -818,8 +846,9 @@ namespace NActors {
             static_assert((MailboxesPerLine & (BlockSize - 1)) == 0,
                 "Per line mailboxes are not divisible into blocks");
 
-            // Note: this line may throw bad_alloc
+            // Note: these allocations may throw bad_alloc
             TMailboxLine* line = new TMailboxLine;
+            TMailboxStatLine* statLine = new TMailboxStatLine;
 
             TMailbox* head = &line->Mailboxes[0];
             TMailbox* tail = head;
@@ -840,6 +869,7 @@ namespace NActors {
             }
 
             // Publish the new line (mailboxes become available via Get using their hint)
+            StatLines[lineIndex].store(statLine, std::memory_order_release);
             Lines[lineIndex].store(line, std::memory_order_release);
             AllocatedLines.store(lineIndex + 1, std::memory_order_relaxed);
 

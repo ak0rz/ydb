@@ -231,6 +231,25 @@ namespace NActors {
 
     static_assert(sizeof(TMailbox) <= 64, "TMailbox is too large");
 
+    // Per-mailbox execution/idle statistics, stored in a separate parallel
+    // array in TMailboxTable so that TMailbox stays at 64 bytes.
+    // Single-writer (mailbox locked during execution), but monitoring may
+    // read from another thread, so all counters use relaxed atomics.
+    struct alignas(64) TMailboxExecStats {
+        std::atomic<ui64> EventsProcessed{0};
+        std::atomic<ui64> TotalExecutionCycles{0};
+        std::atomic<ui64> MaxExecutionCycles{0};
+        std::atomic<ui64> MinExecutionCycles{Max<ui64>()};
+        std::atomic<ui64> LastExecutionEndCycles{0};
+        std::atomic<ui64> TotalIdleCycles{0};
+        std::atomic<ui64> MaxIdleCycles{0};
+        std::atomic<ui64> MinIdleCycles{Max<ui64>()};
+
+        void Reset() noexcept;
+    };
+
+    static_assert(sizeof(TMailboxExecStats) == 64, "TMailboxExecStats must be one cache line");
+
     class TMailboxTable {
     public:
         static constexpr size_t LinesCount = 0x1FFE0u;
@@ -248,6 +267,7 @@ namespace NActors {
         bool Cleanup() noexcept;
 
         TMailbox* Get(ui32 hint) const;
+        TMailboxExecStats* GetStats(ui32 hint) const;
         TMailbox* Allocate();
         std::pair<TMailbox*, size_t> AllocateBlock();
         void Free(TMailbox*);
@@ -264,8 +284,12 @@ namespace NActors {
         TMailbox* AllocateFullBlockLocked();
 
     private:
-        struct TMailboxLine {
+        struct alignas(4096) TMailboxLine {
             TMailbox Mailboxes[MailboxesPerLine];
+        };
+
+        struct alignas(4096) TMailboxStatLine {
+            TMailboxExecStats Stats[MailboxesPerLine];
         };
 
     private:
@@ -280,9 +304,12 @@ namespace NActors {
 
         // A large array of mailbox lines so we don't need extra pointer chasing
         std::atomic<TMailboxLine*> Lines[LinesCount] = { { nullptr } };
+
+        // Parallel array of per-mailbox execution/idle stats (allocated alongside Lines)
+        std::atomic<TMailboxStatLine*> StatLines[LinesCount] = { { nullptr } };
     };
 
-    static_assert(sizeof(TMailboxTable) <= 1048576, "TMailboxTable is too large");
+    static_assert(sizeof(TMailboxTable) <= 2097152, "TMailboxTable is too large");
 
     class TMailboxCache {
     public:
