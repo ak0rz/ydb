@@ -68,7 +68,19 @@ namespace NActors::NWorkStealing {
             hpnow = GetCycleCountFast();
             hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
 
+            if (auto* cs = actor->GetClassStats()) {
+                cs->MessagesProcessed.fetch_add(1, std::memory_order_relaxed);
+                cs->ExecutionCycles.fetch_add(hpnow - hpprev, std::memory_order_relaxed);
+            }
+
             if (!DyingActors.empty()) {
+                for (const auto& dying : DyingActors) {
+                    if (auto* cs = dying->GetClassStats()) {
+                        cs->ActorsDestroyed.fetch_add(1, std::memory_order_relaxed);
+                        cs->LifetimeCyclesSum.fetch_add(
+                            GetCycleCountFast() - dying->GetCreatedAtCycles(), std::memory_order_relaxed);
+                    }
+                }
                 DropUnregistered();
                 actor = nullptr;
             }

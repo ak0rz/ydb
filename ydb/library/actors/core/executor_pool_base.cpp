@@ -14,6 +14,10 @@ namespace NActors {
 
     void DoActorInit(TActorSystem* sys, IActor* actor, const TActorId& self, const TActorId& owner) {
         actor->SelfActorId = self;
+        actor->CreatedAtCycles_ = GetCycleCountFast();
+        if (actor->ClassStats_) {
+            actor->ClassStats_->ActorsCreated.fetch_add(1, std::memory_order_relaxed);
+        }
         actor->Registered(sys, owner);
     }
 

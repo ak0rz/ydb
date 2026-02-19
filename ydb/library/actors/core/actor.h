@@ -1,5 +1,6 @@
 #pragma once
 
+#include "actor_class_stats.h"
 #include "event.h"
 #include "mailbox.h"
 #include "monotonic.h"
@@ -589,6 +590,17 @@ namespace NActors {
     private:
         TActorActivityType ActivityType;
 
+    private:
+        ui32 ClassId_ = Max<ui32>();
+        TActorClassStats* ClassStats_ = nullptr;
+        NHPTimer::STime CreatedAtCycles_ = 0;
+
+    protected:
+        void InitClassInfo(ui32 classId, TActorClassStats* classStats) {
+            ClassId_ = classId;
+            ClassStats_ = classStats;
+        }
+
     protected:
         ui64 HandledEvents;
 
@@ -762,6 +774,15 @@ namespace NActors {
         ui64 GetHandledEvents() const {
             return HandledEvents;
         }
+        ui32 GetClassId() const {
+            return ClassId_;
+        }
+        TActorClassStats* GetClassStats() const {
+            return ClassStats_;
+        }
+        NHPTimer::STime GetCreatedAtCycles() const {
+            return CreatedAtCycles_;
+        }
         TActorIdentity SelfId() const {
             return SelfActorId;
         }
@@ -885,13 +906,19 @@ namespace NActors {
         // static constexpr char ActorName[] = "UNNAMED";
 
         TActor(TDerivedReceiveFunc func)
-            : IActorCallback(static_cast<TReceiveFunc>(func), GetDefaultActivityType()) {
+            : IActorCallback(static_cast<TReceiveFunc>(func), GetDefaultActivityType())
+        {
+            const auto& classInfo = TActorClassInfo<TDerived>::Instance();
+            InitClassInfo(classInfo.ClassId, classInfo.Stats);
         }
 
         template <typename T>
         TActor(TDerivedReceiveFunc func, T&& activityType)
             : IActorCallback(static_cast<TReceiveFunc>(func), std::forward<T>(activityType))
-        {}
+        {
+            const auto& classInfo = TActorClassInfo<TDerived>::Instance();
+            InitClassInfo(classInfo.ClassId, classInfo.Stats);
+        }
 
     public:
         typedef TDerived TThis;

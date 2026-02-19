@@ -16,6 +16,9 @@ ENDIF()
 SRCS(
     activity_guard.cpp
     actor_bootstrapped.cpp
+    actor_class_id.h
+    actor_class_stats.cpp
+    actor_class_stats.h
     actor_coroutine.cpp
     actor_coroutine.h
     actor.cpp
