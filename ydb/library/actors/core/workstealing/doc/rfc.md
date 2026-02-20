@@ -414,6 +414,9 @@ Step 16 System-level A/B Benchmarks   ✓ (ping-pong, star, chain; CSV + CPU uti
 
 ## 12. Benchmark Results
 
+For scenario descriptions, CLI reference, and how to run on remote hardware,
+see [benchmarks.md](benchmarks.md).
+
 ### Hardware
 
 2× AMD EPYC 9654 (96 cores/socket, 192 physical cores, 384 threads with SMT). 5-second measurement, 1-second warmup. Cpuset jail escaped via `taskset`.
