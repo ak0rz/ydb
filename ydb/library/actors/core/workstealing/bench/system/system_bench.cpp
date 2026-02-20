@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <random>
 #include <vector>
 #include <sys/resource.h>
 
@@ -313,6 +314,254 @@ namespace {
     private:
         std::atomic<ui64>& Counter_;
         std::atomic<bool>& Stop_;
+    };
+
+    // -------------------------------------------------------------------
+    // Storage-node scenario: models YDB VDisk actor patterns under load
+    //
+    // Actors:
+    //   - TStorageClient: sends put/get requests to random VDisk skeletons
+    //   - TVDiskSkeleton: central coordinator, routes puts to logger,
+    //                     spawns query actors for gets, handles compaction
+    //   - TLoggerActor: receives log writes, does brief work, responds
+    //   - TQueryActor: spawned per get, does CPU work, responds to client
+    //   - TCompactionActor: periodic CPU-intensive background work
+    //
+    // This approximates the patterns in a YDB storage node where:
+    //   - The Skeleton is a fan-in serialization point
+    //   - Gets spawn concurrent child actors (like real VGet query actors)
+    //   - Puts go through a serial pipeline (Skeleton → Logger → Skeleton)
+    //   - Compaction creates periodic bursts of background CPU work
+    // -------------------------------------------------------------------
+
+    struct TEvClientRequest: NActors::TEventLocal<TEvClientRequest, 10701> {
+        bool IsPut;
+        TEvClientRequest(bool isPut) : IsPut(isPut) {}
+    };
+
+    struct TEvClientResponse: NActors::TEventLocal<TEvClientResponse, 10702> {};
+
+    struct TEvLogWrite: NActors::TEventLocal<TEvLogWrite, 10703> {
+        NActors::TActorId Client; // original client to respond to
+        TEvLogWrite(NActors::TActorId client) : Client(client) {}
+    };
+
+    struct TEvLogResult: NActors::TEventLocal<TEvLogResult, 10704> {
+        NActors::TActorId Client;
+        TEvLogResult(NActors::TActorId client) : Client(client) {}
+    };
+
+    struct TEvCompactionTick: NActors::TEventLocal<TEvCompactionTick, 10705> {};
+    struct TEvCompactionTask: NActors::TEventLocal<TEvCompactionTask, 10706> {};
+    struct TEvCompactionDone: NActors::TEventLocal<TEvCompactionDone, 10707> {};
+
+    // Burn CPU for a calibrated number of iterations (~1 iter ≈ 1 ns on modern CPUs)
+    Y_NO_INLINE void BusyWork(ui64 iterations) {
+        volatile ui64 x = 0;
+        for (ui64 i = 0; i < iterations; ++i) {
+            x += i * 7 + 1;
+        }
+    }
+
+    // Parameters for storage-node scenario
+    struct TStorageNodeParams {
+        ui32 VDisks = 8;
+        ui32 Clients = 32;
+        double PutRatio = 0.5;
+        ui64 PutWorkIters = 500;        // ~0.5 us: log record creation
+        ui64 LogWorkIters = 300;         // ~0.3 us: log serialization
+        ui64 GetWorkIters = 5000;        // ~5 us: LSM tree lookup + read
+        ui64 CompactionWorkIters = 50000; // ~50 us: merge/sort burst
+        ui32 CompactionPeriodMs = 50;    // how often compaction fires
+    };
+
+    // --- TQueryActor: spawned per get request, does CPU work, responds ---
+
+    class TQueryActor: public NActors::TActorBootstrapped<TQueryActor> {
+    public:
+        TQueryActor(NActors::TActorId client, ui64 workIters)
+            : Client_(client)
+            , WorkIters_(workIters)
+        {}
+
+        void Bootstrap() {
+            BusyWork(WorkIters_);
+            Send(Client_, new TEvClientResponse());
+            PassAway();
+        }
+
+    private:
+        NActors::TActorId Client_;
+        ui64 WorkIters_;
+    };
+
+    // --- TLoggerActor: one per VDisk, serializes log writes ---
+
+    class TLoggerActor: public NActors::TActor<TLoggerActor> {
+    public:
+        TLoggerActor(ui64 workIters)
+            : TActor(&TLoggerActor::StateFunc)
+            , WorkIters_(workIters)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvLogWrite, HandleLogWrite);
+            }
+        }
+
+    private:
+        void HandleLogWrite(TEvLogWrite::TPtr& ev) {
+            BusyWork(WorkIters_);
+            Send(ev->Sender, new TEvLogResult(ev->Get()->Client));
+        }
+
+        ui64 WorkIters_;
+    };
+
+    // --- TCompactionActor: periodic background CPU bursts ---
+
+    class TCompactionActor: public NActors::TActor<TCompactionActor> {
+    public:
+        TCompactionActor(ui64 workIters)
+            : TActor(&TCompactionActor::StateFunc)
+            , WorkIters_(workIters)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvCompactionTask, HandleTask);
+            }
+        }
+
+    private:
+        void HandleTask(TEvCompactionTask::TPtr& ev) {
+            BusyWork(WorkIters_);
+            Send(ev->Sender, new TEvCompactionDone());
+        }
+
+        ui64 WorkIters_;
+    };
+
+    // --- TVDiskSkeleton: central coordinator ---
+
+    class TVDiskSkeleton: public NActors::TActor<TVDiskSkeleton> {
+    public:
+        TVDiskSkeleton(NActors::TActorId loggerId,
+                       NActors::TActorId compactionId,
+                       std::atomic<ui64>& counter,
+                       std::atomic<bool>& stop,
+                       const TStorageNodeParams& params,
+                       ui32 poolId)
+            : TActor(&TVDiskSkeleton::StateFunc)
+            , LoggerId_(loggerId)
+            , CompactionId_(compactionId)
+            , Counter_(counter)
+            , Stop_(stop)
+            , Params_(params)
+            , PoolId_(poolId)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvClientRequest, HandleClientRequest);
+                hFunc(TEvLogResult, HandleLogResult);
+                hFunc(TEvCompactionTick, HandleCompactionTick);
+                hFunc(TEvCompactionDone, HandleCompactionDone);
+            }
+        }
+
+    private:
+        void HandleClientRequest(TEvClientRequest::TPtr& ev) {
+            if (ev->Get()->IsPut) {
+                // Put: small CPU work (validation/LSN allocation), then forward to logger
+                BusyWork(Params_.PutWorkIters);
+                Send(LoggerId_, new TEvLogWrite(ev->Sender));
+            } else {
+                // Get: spawn a query actor that does CPU work and responds directly
+                auto* query = new TQueryActor(ev->Sender, Params_.GetWorkIters);
+                Register(query, NActors::TMailboxType::HTSwap, PoolId_);
+            }
+        }
+
+        void HandleLogResult(TEvLogResult::TPtr& ev) {
+            // Log write completed, respond to original client
+            Counter_.fetch_add(1, std::memory_order_relaxed);
+            if (!Stop_.load(std::memory_order_relaxed)) {
+                Send(ev->Get()->Client, new TEvClientResponse());
+            }
+        }
+
+        void HandleCompactionTick(TEvCompactionTick::TPtr& /*ev*/) {
+            if (!Stop_.load(std::memory_order_relaxed)) {
+                Send(CompactionId_, new TEvCompactionTask());
+            }
+        }
+
+        void HandleCompactionDone(TEvCompactionDone::TPtr& /*ev*/) {
+            // Compaction finished, schedule next tick
+            if (!Stop_.load(std::memory_order_relaxed)) {
+                Schedule(TDuration::MilliSeconds(Params_.CompactionPeriodMs),
+                         new TEvCompactionTick());
+            }
+        }
+
+        NActors::TActorId LoggerId_;
+        NActors::TActorId CompactionId_;
+        std::atomic<ui64>& Counter_;
+        std::atomic<bool>& Stop_;
+        TStorageNodeParams Params_;
+        ui32 PoolId_;
+    };
+
+    // --- TStorageClient: sends put/get requests to random VDisks ---
+
+    class TStorageClient: public NActors::TActor<TStorageClient> {
+    public:
+        TStorageClient(std::vector<NActors::TActorId> vdisks,
+                       std::atomic<ui64>& counter,
+                       std::atomic<bool>& stop,
+                       double putRatio,
+                       ui32 seed)
+            : TActor(&TStorageClient::StateFunc)
+            , VDisks_(std::move(vdisks))
+            , Counter_(counter)
+            , Stop_(stop)
+            , PutThreshold_(static_cast<ui32>(putRatio * 0xFFFFFFFF))
+            , Rng_(seed)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvClientResponse, HandleResponse);
+                hFunc(TEvBenchMsg, HandleKick);
+            }
+        }
+
+    private:
+        void HandleResponse(TEvClientResponse::TPtr& /*ev*/) {
+            Counter_.fetch_add(1, std::memory_order_relaxed);
+            SendNextRequest();
+        }
+
+        void HandleKick(TEvBenchMsg::TPtr& /*ev*/) {
+            SendNextRequest();
+        }
+
+        void SendNextRequest() {
+            if (Stop_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            ui32 vdiskIdx = Rng_() % VDisks_.size();
+            bool isPut = (Rng_() < PutThreshold_);
+            Send(VDisks_[vdiskIdx], new TEvClientRequest(isPut));
+        }
+
+        std::vector<NActors::TActorId> VDisks_;
+        std::atomic<ui64>& Counter_;
+        std::atomic<bool>& Stop_;
+        ui32 PutThreshold_;
+        std::minstd_rand Rng_;
     };
 
     // -------------------------------------------------------------------
@@ -618,6 +867,90 @@ namespace {
         };
     }
 
+    TBenchResult RunStorageNode(const TString& poolType, ui32 threads,
+                                const TStorageNodeParams& params,
+                                ui32 warmupSec, ui32 durationSec) {
+        auto setup = (poolType == "ws")
+            ? MakeWSSetup(threads, GSpinThresholdCycles)
+            : MakeBasicSetup(threads);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = BenchPoolId(poolType);
+
+        std::atomic<ui64> counter{0};
+        std::atomic<bool> stop{false};
+
+        // Create per-VDisk actor groups
+        std::vector<NActors::TActorId> skeletonIds;
+        for (ui32 i = 0; i < params.VDisks; ++i) {
+            // Logger for this VDisk
+            auto* logger = new TLoggerActor(params.LogWorkIters);
+            auto loggerId = sys.Register(logger, NActors::TMailboxType::HTSwap, pool);
+
+            // Compaction worker for this VDisk
+            auto* compaction = new TCompactionActor(params.CompactionWorkIters);
+            auto compactionId = sys.Register(compaction, NActors::TMailboxType::HTSwap, pool);
+
+            // VDisk skeleton
+            auto* skeleton = new TVDiskSkeleton(
+                loggerId, compactionId, counter, stop, params, pool);
+            auto skeletonId = sys.Register(skeleton, NActors::TMailboxType::HTSwap, pool);
+            skeletonIds.push_back(skeletonId);
+
+            // Kick off compaction cycle
+            sys.Send(skeletonId, new TEvCompactionTick());
+        }
+
+        // Create client actors
+        for (ui32 i = 0; i < params.Clients; ++i) {
+            auto* client = new TStorageClient(
+                skeletonIds, counter, stop, params.PutRatio, 42 + i);
+            auto clientId = sys.Register(client, NActors::TMailboxType::HTSwap, pool);
+            // Kick off the request loop
+            sys.Send(clientId, new TEvBenchMsg());
+        }
+
+        // Warmup
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        counter.store(0, std::memory_order_relaxed);
+        ResetWsCounters();
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+
+        ui64 ops = counter.load(std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+
+        double opsPerSec = (elapsed > 0) ? (double)ops / elapsed : 0;
+        double avgLatencyUs = (ops > 0) ? (elapsed * 1e6 / ops) : 0;
+
+        char label[128];
+        std::snprintf(label, sizeof(label), "%s/storage-node t=%u v=%u c=%u",
+                      poolType.c_str(), threads, params.VDisks, params.Clients);
+        DumpWsCounters(label);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sys.Stop();
+
+        return TBenchResult{
+            .PoolType = poolType,
+            .Scenario = "storage-node",
+            .Threads = threads,
+            .ActorPairs = params.VDisks,
+            .OpsPerSec = opsPerSec,
+            .AvgLatencyUs = avgLatencyUs,
+            .CpuSeconds = cpuAfter - cpuBefore,
+            .WallSeconds = elapsed,
+        };
+    }
+
 } // anonymous namespace
 
 int main(int argc, const char* argv[]) {
@@ -630,7 +963,7 @@ int main(int argc, const char* argv[]) {
         .StoreResult(&poolType);
 
     TString scenario = "all";
-    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, or all")
+    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, storage-node, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -664,6 +997,47 @@ int main(int argc, const char* argv[]) {
         .DefaultValue("0")
         .StoreResult(&minSpinThreshold);
 
+    // Storage-node scenario parameters
+    ui32 vdisks = 8;
+    opts.AddLongOption("vdisks", "Number of VDisk actor groups (storage-node scenario)")
+        .DefaultValue("8")
+        .StoreResult(&vdisks);
+
+    ui32 clients = 32;
+    opts.AddLongOption("clients", "Number of client actors (storage-node scenario)")
+        .DefaultValue("32")
+        .StoreResult(&clients);
+
+    double putRatio = 0.5;
+    opts.AddLongOption("put-ratio", "Fraction of requests that are puts vs gets (0.0-1.0)")
+        .DefaultValue("0.5")
+        .StoreResult(&putRatio);
+
+    ui64 putWorkIters = 500;
+    opts.AddLongOption("put-work", "CPU iterations per put in skeleton (~1 iter = 1 ns)")
+        .DefaultValue("500")
+        .StoreResult(&putWorkIters);
+
+    ui64 logWorkIters = 300;
+    opts.AddLongOption("log-work", "CPU iterations per log write in logger")
+        .DefaultValue("300")
+        .StoreResult(&logWorkIters);
+
+    ui64 getWorkIters = 5000;
+    opts.AddLongOption("get-work", "CPU iterations per get in query actor")
+        .DefaultValue("5000")
+        .StoreResult(&getWorkIters);
+
+    ui64 compactionWorkIters = 50000;
+    opts.AddLongOption("compaction-work", "CPU iterations per compaction burst")
+        .DefaultValue("50000")
+        .StoreResult(&compactionWorkIters);
+
+    ui32 compactionPeriodMs = 50;
+    opts.AddLongOption("compaction-period", "Compaction trigger interval in ms")
+        .DefaultValue("50")
+        .StoreResult(&compactionPeriodMs);
+
     NLastGetopt::TOptsParseResult res(&opts, argc, argv);
 
     GSpinThresholdCycles = spinThreshold;
@@ -679,9 +1053,19 @@ int main(int argc, const char* argv[]) {
         poolTypes = {poolType};
     }
 
+    TStorageNodeParams storageParams;
+    storageParams.VDisks = vdisks;
+    storageParams.Clients = clients;
+    storageParams.PutRatio = putRatio;
+    storageParams.PutWorkIters = putWorkIters;
+    storageParams.LogWorkIters = logWorkIters;
+    storageParams.GetWorkIters = getWorkIters;
+    storageParams.CompactionWorkIters = compactionWorkIters;
+    storageParams.CompactionPeriodMs = compactionPeriodMs;
+
     std::vector<TString> scenarios;
     if (scenario == "all") {
-        scenarios = {"ping-pong", "star", "chain", "reincarnation"};
+        scenarios = {"ping-pong", "star", "chain", "reincarnation", "storage-node"};
     } else {
         scenarios = {scenario};
     }
@@ -691,20 +1075,29 @@ int main(int argc, const char* argv[]) {
 
     for (const auto& sc : scenarios) {
         for (ui32 t : threads) {
-            for (ui32 p : pairs) {
+            if (sc == "storage-node") {
+                // Storage-node uses vdisks/clients instead of pairs
                 for (const auto& pt : poolTypes) {
-                    TBenchResult result;
-                    if (sc == "ping-pong") {
-                        result = RunPingPong(pt, t, p, warmupSec, durationSec);
-                    } else if (sc == "star") {
-                        result = RunStar(pt, t, p, warmupSec, durationSec);
-                    } else if (sc == "chain") {
-                        result = RunChain(pt, t, p, warmupSec, durationSec);
-                    } else if (sc == "reincarnation") {
-                        result = RunReincarnation(pt, t, p, warmupSec, durationSec);
-                    }
+                    auto result = RunStorageNode(pt, t, storageParams, warmupSec, durationSec);
                     result.PrintCSV();
                     std::fflush(stdout);
+                }
+            } else {
+                for (ui32 p : pairs) {
+                    for (const auto& pt : poolTypes) {
+                        TBenchResult result;
+                        if (sc == "ping-pong") {
+                            result = RunPingPong(pt, t, p, warmupSec, durationSec);
+                        } else if (sc == "star") {
+                            result = RunStar(pt, t, p, warmupSec, durationSec);
+                        } else if (sc == "chain") {
+                            result = RunChain(pt, t, p, warmupSec, durationSec);
+                        } else if (sc == "reincarnation") {
+                            result = RunReincarnation(pt, t, p, warmupSec, durationSec);
+                        }
+                        result.PrintCSV();
+                        std::fflush(stdout);
+                    }
                 }
             }
         }

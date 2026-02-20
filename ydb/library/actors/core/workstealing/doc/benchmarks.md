@@ -1,7 +1,7 @@
 # WS System Benchmarks
 
 A/B benchmark comparing the work-stealing executor pool (`ws`) against the
-baseline shared-queue executor pool (`basic`) across four messaging topologies.
+baseline shared-queue executor pool (`basic`) across five messaging topologies.
 
 Source: `ydb/library/actors/core/workstealing/bench/system/system_bench.cpp`
 
@@ -23,13 +23,21 @@ ws_system_bench [OPTIONS]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--pool-type` | `both` | `basic`, `ws`, or `both` |
-| `--scenario` | `all` | `ping-pong`, `star`, `chain`, `reincarnation`, or `all` |
+| `--scenario` | `all` | `ping-pong`, `star`, `chain`, `reincarnation`, `storage-node`, or `all` |
 | `--threads` | `1,2,4,8` | Comma-separated thread counts |
 | `--pairs` | `10,100` | Comma-separated actor counts (pairs / senders / chain length) |
 | `--duration` | `5` | Measurement seconds per scenario |
 | `--warmup` | `1` | Warmup seconds before measurement (counters reset after) |
 | `--spin-threshold` | `0` | WS spin threshold in CPU cycles (0 = default 100k) |
 | `--min-spin-threshold` | `0` | WS min spin threshold in CPU cycles (0 = default 10k) |
+| `--vdisks` | `8` | Number of VDisk actor groups (storage-node scenario) |
+| `--clients` | `32` | Number of client actors (storage-node scenario) |
+| `--put-ratio` | `0.5` | Fraction of requests that are puts vs gets (0.0–1.0) |
+| `--put-work` | `500` | CPU iterations per put in skeleton (~1 iter ≈ 1 ns) |
+| `--log-work` | `300` | CPU iterations per log write in logger |
+| `--get-work` | `5000` | CPU iterations per get in query actor |
+| `--compaction-work` | `50000` | CPU iterations per compaction burst |
+| `--compaction-period` | `50` | Compaction trigger interval in ms |
 
 ### Output
 
@@ -45,7 +53,7 @@ counters (exec, stolen, steal attempts, idle/busy polls, parks/wakes).
 ## Scenarios
 
 All scenarios count events processed by actor `Receive` handlers. One
-"operation" = one event delivered and processed. The four topologies stress
+"operation" = one event delivered and processed. The five topologies stress
 different aspects of the scheduler.
 
 ### 1. Ping-Pong
@@ -165,6 +173,66 @@ destroys a mailbox. The WS pool's slot-affine routing helps here: newly
 registered actors often land on the same slot as their parent, reducing
 cross-slot hops.
 
+### 5. Storage Node
+
+Composite scenario modeling YDB storage node actor patterns under heavy load.
+Combines fan-in serialization, pipeline processing, concurrent child actors,
+and periodic background CPU bursts.
+
+```mermaid
+graph TD
+    subgraph "× C clients"
+        CL[StorageClient]
+    end
+
+    subgraph "× V VDisk groups"
+        SK[Skeleton] --> LOG[Logger]
+        LOG --> SK
+        SK --> COMP[CompactionActor]
+        COMP --> SK
+        SK -.-> Q1[QueryActor]
+        SK -.-> Q2[QueryActor]
+    end
+
+    CL -- "put/get" --> SK
+    Q1 -. response .-> CL
+    Q2 -. response .-> CL
+    SK -- "put response" --> CL
+```
+
+**Setup:** V VDisk groups × C client actors. Each VDisk group contains three
+long-lived actors (Skeleton, Logger, CompactionActor). Clients send randomized
+put/get requests to random VDisks. Puts flow through a pipeline
+(Skeleton → Logger → Skeleton → Client). Gets spawn a one-shot TQueryActor
+that does CPU work and responds directly to the client. Compaction fires
+periodically via `Schedule()`, sending work to the CompactionActor.
+
+**What it measures:**
+- Fan-in serialization: multiple clients target the same Skeleton (like real
+  SkeletonFront → Skeleton routing)
+- Pipeline latency: put requests traverse Skeleton → Logger → Skeleton → Client
+  (3 hops, modeling the real PDisk log write pipeline)
+- Child actor spawning: gets create one-shot query actors on the executor pool
+  (like real VGet query actors)
+- Background CPU bursts: compaction creates periodic heavy work items that
+  compete with request processing for CPU time
+- Mixed workload scheduling: lightweight messages (control flow) interleaved
+  with CPU-intensive actors (query, compaction)
+
+**Tuning knobs:**
+- `--put-ratio` controls the put/get mix; higher values increase pipeline
+  traffic, lower values increase child actor spawning
+- `--put-work` / `--log-work` control per-message CPU cost in the pipeline
+- `--get-work` controls CPU cost of spawned query actors
+- `--compaction-work` / `--compaction-period` control background CPU pressure
+
+**Known characteristics:** The Skeleton actors are serialization points (like
+the real VDisk Skeleton), creating natural fan-in bottlenecks. With many
+clients targeting few VDisks, this resembles the star topology's hot-mailbox
+pattern but with additional pipeline depth and child actor dynamics. WS
+benefits from slot affinity keeping each VDisk group's actors local;
+basic benefits from its shared queue distributing Skeleton activations.
+
 ## Reading the WS Counter Lines
 
 Each WS run prints a comment line before the CSV row:
@@ -201,6 +269,7 @@ Key ratios to watch:
 | star | One message delivered to the receiver |
 | chain | One forward hop in the ring |
 | reincarnation | One actor created, messaged, and destroyed |
+| storage-node | One client request completed (put pipeline or get query) |
 
 ### Typical performance profiles
 
@@ -210,3 +279,4 @@ Key ratios to watch:
 | star | — | Single hot receiver serializes on one slot; basic's shared queue distributes better |
 | chain | Low latency from slot affinity for consecutive actors | Only 1 message in flight, can't exploit parallelism |
 | reincarnation | Budget-aware stealing reduces churn; new actors inherit parent's slot | High mailbox alloc/free overhead is pool-independent |
+| storage-node | Slot affinity keeps VDisk actor groups local; pipeline hops stay on-slot | Skeleton fan-in from many clients can bottleneck on one slot |
