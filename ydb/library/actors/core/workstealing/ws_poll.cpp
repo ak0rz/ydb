@@ -12,21 +12,22 @@ namespace NActors::NWorkStealing {
         bool ExecuteBatch(
             const TExecuteCallback& executeCallback,
             ui32 activation,
-            uint64_t deadlineCycles,
+            NHPTimer::STime deadlineCycles,
             size_t& execBudget,
             bool& didWork,
-            TWsSlotCounters& counters)
+            TWsSlotCounters& counters,
+            NHPTimer::STime& hpnow)
         {
             bool hasMore = false;
             while (execBudget > 0) {
-                hasMore = executeCallback(activation);
+                hasMore = executeCallback(activation, hpnow);
                 if (!hasMore) {
                     break;
                 }
                 didWork = true;
                 --execBudget;
                 counters.Executions.fetch_add(1, std::memory_order_relaxed);
-                if (GetCycleCountFast() >= deadlineCycles) {
+                if (hpnow >= deadlineCycles) {
                     break;
                 }
             }
@@ -45,25 +46,56 @@ namespace NActors::NWorkStealing {
         size_t execBudget = config.MaxExecBatch;
 
         // Step 1: Pop and execute from our queue.
-        // Process events from each mailbox for up to MailboxBatchCycles
-        // before push-back. This amortizes MPMC queue overhead for hot
-        // mailboxes while still interleaving activations.
+        // Each mailbox runs for up to MailboxBatchCycles before checking
+        // the queue. If the queue is empty, continue the same mailbox
+        // without bouncing it (avoids false steal potential and redundant
+        // mailbox table walks).
+        std::optional<ui32> activation;
         while (execBudget > 0) {
-            auto activation = slot.Pop();
             if (!activation) {
-                break;
+                activation = slot.Pop();
+                if (!activation) {
+                    break;
+                }
             }
 
             slot.Executing.store(true, std::memory_order_release);
-            uint64_t deadline = GetCycleCountFast() + config.MailboxBatchCycles;
-            bool hasMore = ExecuteBatch(
-                executeCallback, *activation, deadline,
-                execBudget, didWork, slot.Counters);
+            NHPTimer::STime hpnow = GetCycleCountFast();
+            NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
+
+            bool hasMore = false;
+            for (;;) {
+                hasMore = executeCallback(*activation, hpnow);
+                if (!hasMore) {
+                    break;
+                }
+                didWork = true;
+                --execBudget;
+                slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
+                if (execBudget == 0) {
+                    break;
+                }
+                if (hpnow >= deadline) {
+                    // Time slice expired — check if queue has other work
+                    auto next = slot.Pop();
+                    if (next) {
+                        slot.Push(*activation);
+                        activation = next;
+                        break;
+                    }
+                    // Queue empty — continue same mailbox, reset deadline
+                    deadline = hpnow + config.MailboxBatchCycles;
+                }
+            }
+
             slot.Executing.store(false, std::memory_order_release);
 
-            if (hasMore) {
-                slot.Push(*activation);
+            if (!hasMore) {
+                activation.reset();
             }
+        }
+        if (activation) {
+            slot.Push(*activation);
         }
 
         if (didWork) {
@@ -97,32 +129,26 @@ namespace NActors::NWorkStealing {
                 }
                 slot.Counters.StealAttempts.fetch_add(1, std::memory_order_relaxed);
 
-                size_t stolen = victim->StealHalf(stealBuf, kStealBufSize);
+                size_t stolen = victim->Steal(stealBuf, kStealBufSize,
+                                              config.MailboxBatchCycles);
                 if (stolen == 0) {
                     continue;
                 }
                 slot.Counters.StolenItems.fetch_add(stolen, std::memory_order_relaxed);
 
-                for (size_t i = 0; i < stolen; ++i) {
-                    slot.Push(stealBuf[i]);
-                }
-
-                // Execute stolen items with same batched model
-                while (execBudget > 0) {
-                    auto activation = slot.Pop();
-                    if (!activation) {
-                        break;
-                    }
-
+                // Execute directly from steal buffer — no reinjection.
+                // Stolen items can't be re-stolen while we process them.
+                NHPTimer::STime hpnow = GetCycleCountFast();
+                for (size_t i = 0; i < stolen && execBudget > 0; ++i) {
                     slot.Executing.store(true, std::memory_order_release);
-                    uint64_t deadline = GetCycleCountFast() + config.MailboxBatchCycles;
+                    NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
                     bool hasMore = ExecuteBatch(
-                        executeCallback, *activation, deadline,
-                        execBudget, didWork, slot.Counters);
+                        executeCallback, stealBuf[i], deadline,
+                        execBudget, didWork, slot.Counters, hpnow);
                     slot.Executing.store(false, std::memory_order_release);
 
                     if (hasMore) {
-                        slot.Push(*activation);
+                        slot.Push(stealBuf[i]);  // push back only if mailbox still has events
                     }
                 }
 

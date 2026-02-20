@@ -1,5 +1,7 @@
 #include "ws_slot.h"
 
+#include <ydb/library/actors/core/mailbox_lockfree.h>
+
 #include <util/system/yassert.h>
 
 #include <algorithm>
@@ -50,21 +52,34 @@ namespace NActors::NWorkStealing {
         return result;
     }
 
-    size_t TSlot::StealHalf(ui32* out, size_t max) {
+    size_t TSlot::Steal(ui32* out, size_t maxCount, NHPTimer::STime cyclesBudget) {
         ESlotState state = State_.load(std::memory_order_acquire);
         if (state != ESlotState::Active && state != ESlotState::Draining) {
             return 0;
         }
-        size_t estimate = SizeEstimate();
-        size_t target = std::min(std::max(estimate / 2, size_t(1)), max);
+        NHPTimer::STime totalCost = 0;
         size_t count = 0;
-        while (count < target) {
+        while (count < maxCount) {
             auto item = Queue_.TryPop();
             if (!item) {
                 break;
             }
             ApproxSize_.fetch_sub(1, std::memory_order_relaxed);
             out[count++] = *item;
+
+            // Accumulate estimated cost from mailbox stats
+            if (MailboxTable) {
+                if (auto* stats = MailboxTable->GetStats(*item)) {
+                    ui64 events = stats->EventsProcessed.load(std::memory_order_relaxed);
+                    ui64 cycles = stats->TotalExecutionCycles.load(std::memory_order_relaxed);
+                    if (events > 0) {
+                        totalCost += static_cast<NHPTimer::STime>(cycles / events);
+                    }
+                }
+            }
+            if (totalCost >= cyclesBudget) {
+                break;
+            }
         }
         return count;
     }

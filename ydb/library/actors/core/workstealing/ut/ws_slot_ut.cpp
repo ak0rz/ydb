@@ -2,6 +2,8 @@
 
 #include <library/cpp/testing/unittest/registar.h>
 
+#include <util/generic/ylimits.h>
+#include <util/system/hp_timer.h>
 #include <util/system/sanitizers.h>
 
 #include <thread>
@@ -141,7 +143,7 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT(!slot.Pop().has_value());
         }
 
-        Y_UNIT_TEST(StealHalfWhenActive) {
+        Y_UNIT_TEST(StealWhenActive) {
             TSlot slot;
             ActivateSlot(slot);
 
@@ -154,11 +156,12 @@ namespace NActors::NWorkStealing {
             size_t stolen = 0;
 
             std::thread stealer([&] {
-                stolen = slot.StealHalf(buffer, N);
+                stolen = slot.Steal(buffer, N, Max<NHPTimer::STime>());
             });
             stealer.join();
 
-            UNIT_ASSERT_VALUES_EQUAL(stolen, N / 2);
+            // With no MailboxTable and max budget, steals up to maxCount items
+            UNIT_ASSERT(stolen > 0 && stolen <= N);
 
             // Verify stolen items are valid (1..N range, no duplicates)
             std::vector<ui32> stolenVec(buffer, buffer + stolen);
@@ -169,7 +172,7 @@ namespace NActors::NWorkStealing {
             }
         }
 
-        Y_UNIT_TEST(StealHalfWhenDraining) {
+        Y_UNIT_TEST(StealWhenDraining) {
             TSlot slot;
             ActivateSlot(slot);
 
@@ -184,21 +187,21 @@ namespace NActors::NWorkStealing {
             size_t stolen = 0;
 
             std::thread stealer([&] {
-                stolen = slot.StealHalf(buffer, N);
+                stolen = slot.Steal(buffer, N, Max<NHPTimer::STime>());
             });
             stealer.join();
 
             UNIT_ASSERT(stolen > 0);
         }
 
-        Y_UNIT_TEST(StealHalfWhenInactive) {
+        Y_UNIT_TEST(StealWhenInactive) {
             TSlot slot;
 
             ui32 buffer[8];
             size_t stolen = 0;
 
             std::thread stealer([&] {
-                stolen = slot.StealHalf(buffer, 8);
+                stolen = slot.Steal(buffer, 8, Max<NHPTimer::STime>());
             });
             stealer.join();
 
@@ -245,14 +248,14 @@ namespace NActors::NWorkStealing {
                     startBarrier.arrive_and_wait();
                     ui32 buf[128];
                     while (!stop.load(std::memory_order_acquire)) {
-                        size_t n = slot.StealHalf(buf, 128);
+                        size_t n = slot.Steal(buf, 128, Max<NHPTimer::STime>());
                         for (size_t i = 0; i < n; ++i) {
                             stealerResults[s].push_back(buf[i]);
                         }
                     }
                     // Final drain after stop
                     for (int pass = 0; pass < 3; ++pass) {
-                        size_t n = slot.StealHalf(buf, 128);
+                        size_t n = slot.Steal(buf, 128, Max<NHPTimer::STime>());
                         for (size_t i = 0; i < n; ++i) {
                             stealerResults[s].push_back(buf[i]);
                         }
@@ -363,7 +366,7 @@ namespace NActors::NWorkStealing {
                             ownerResults[s].push_back(*item);
                         }
                         // Steal from neighbor
-                        size_t n = slots[nextSlot].StealHalf(stealBuf, 128);
+                        size_t n = slots[nextSlot].Steal(stealBuf, 128, Max<NHPTimer::STime>());
                         for (size_t i = 0; i < n; ++i) {
                             stealResults[s].push_back(stealBuf[i]);
                         }
@@ -458,7 +461,7 @@ namespace NActors::NWorkStealing {
                     start.arrive_and_wait();
                     ui32 buf[64];
                     while (!done.load(std::memory_order_acquire)) {
-                        size_t n = slot.StealHalf(buf, 64);
+                        size_t n = slot.Steal(buf, 64, Max<NHPTimer::STime>());
                         for (size_t i = 0; i < n; ++i) {
                             stealerResults[s].push_back(buf[i]);
                         }
@@ -466,7 +469,7 @@ namespace NActors::NWorkStealing {
                     }
                     // Final passes
                     for (int pass = 0; pass < 5; ++pass) {
-                        size_t n = slot.StealHalf(buf, 64);
+                        size_t n = slot.Steal(buf, 64, Max<NHPTimer::STime>());
                         for (size_t i = 0; i < n; ++i) {
                             stealerResults[s].push_back(buf[i]);
                         }

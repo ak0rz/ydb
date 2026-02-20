@@ -3,6 +3,7 @@
 #include "ws_slot.h"
 #include "ws_config.h"
 
+#include <util/system/hp_timer.h>
 #include <util/system/types.h>
 
 #include <cstddef>
@@ -33,7 +34,11 @@ namespace NActors::NWorkStealing {
     // Called with the activation hint (mailbox index).
     // Returns true if an event was processed (more events might remain).
     // Returns false if no event was available (mailbox was finalized).
-    using TExecuteCallback = std::function<bool(ui32 hint)>;
+    // hpnow is input-output: on entry, the caller's current cycle timestamp
+    // (used by the callback for pre-event stats); on exit, updated to
+    // post-event GetCycleCountFast(). This eliminates redundant rdtsc
+    // calls — one GetCycleCountFast() per event total.
+    using TExecuteCallback = std::function<bool(ui32 hint, NHPTimer::STime& hpnow)>;
 
     // Per-slot state for polling. Tracks consecutive idle polls to
     // control steal frequency (backoff).
@@ -53,8 +58,8 @@ namespace NActors::NWorkStealing {
     //    - Overall budget (MaxExecBatch) is per-event, checked each iteration
     //    - Return Busy if any work was done
     // 2. No local work: try stealing from neighbors via stealIterator
-    //    - StealHalf into stack buffer, push stolen items into our queue
-    //    - Execute with same single-event model
+    //    - Steal into stack buffer (budget-aware, no reinjection)
+    //    - Execute directly from the steal buffer
     //    - Return Busy if any work was done
     // 3. Nothing found anywhere: return Idle
     EPollResult PollSlot(

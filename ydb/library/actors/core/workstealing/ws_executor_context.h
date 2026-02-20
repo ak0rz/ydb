@@ -45,7 +45,9 @@ namespace NActors::NWorkStealing {
         // Returns false if no event was available (Pop() returned nullptr).
         // Does NOT finalize the mailbox — caller must call FinishMailbox
         // when ExecuteSingleEvent returns false.
-        bool ExecuteSingleEvent(TMailbox* mailbox);
+        // Writes the cycle counter (from GetCycleCountFast() already used
+        // for stats) to hpnowOut, so callers can reuse it.
+        bool ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnowOut);
 
         // Finalize the mailbox after the last ExecuteSingleEvent returns false.
         // Unlocks or frees the mailbox as appropriate.

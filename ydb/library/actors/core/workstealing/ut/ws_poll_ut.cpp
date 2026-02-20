@@ -47,7 +47,7 @@ namespace NActors::NWorkStealing {
             std::vector<ui32>& executed,
             std::map<ui32, ui32>& remaining)
         {
-            return [&](ui32 hint) -> bool {
+            return [&](ui32 hint, NHPTimer::STime&) -> bool {
                 auto it = remaining.find(hint);
                 if (it == remaining.end() || it->second == 0) {
                     return false; // no events
@@ -87,7 +87,7 @@ namespace NActors::NWorkStealing {
             ActivateSlot(slot);
 
             bool callbackCalled = false;
-            TExecuteCallback cb = [&](ui32) -> bool {
+            TExecuteCallback cb = [&](ui32, NHPTimer::STime&) -> bool {
                 callbackCalled = true;
                 return false;
             };
@@ -109,7 +109,7 @@ namespace NActors::NWorkStealing {
             slot.Push(7);
 
             ui32 callCount = 0;
-            TExecuteCallback cb = [&](ui32) -> bool {
+            TExecuteCallback cb = [&](ui32, NHPTimer::STime&) -> bool {
                 ++callCount;
                 return callCount < 3; // 3 events total
             };
@@ -135,7 +135,7 @@ namespace NActors::NWorkStealing {
             slot.Push(7);
 
             ui32 callCount = 0;
-            TExecuteCallback cb = [&](ui32) -> bool {
+            TExecuteCallback cb = [&](ui32, NHPTimer::STime&) -> bool {
                 ++callCount;
                 return true; // always more events
             };
@@ -253,7 +253,7 @@ namespace NActors::NWorkStealing {
             TTestStealIterator iter(empty);
 
             bool callbackCalled = false;
-            TExecuteCallback cb = [&](ui32) -> bool {
+            TExecuteCallback cb = [&](ui32, NHPTimer::STime&) -> bool {
                 callbackCalled = true;
                 return false;
             };
@@ -302,7 +302,7 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT_EQUAL(idle, EPollResult::Idle);
         }
 
-        Y_UNIT_TEST(StealPushesIntoDeque) {
+        Y_UNIT_TEST(StealExecutesDirectly) {
             TSlot slotA;
             ActivateSlot(slotA);
 
@@ -332,8 +332,8 @@ namespace NActors::NWorkStealing {
             EPollResult result = PollSlot(slotA, &iter, cb, config, ps);
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
 
-            // Should have stolen half of 6 = 3 items and executed all of them
-            UNIT_ASSERT_VALUES_EQUAL(executed.size(), 3u);
+            // Without MailboxTable, steals up to maxCount and executes directly
+            UNIT_ASSERT(executed.size() > 0 && executed.size() <= 6u);
 
             // All executed hints should be from the stolen range
             for (ui32 hint : executed) {
@@ -346,7 +346,7 @@ namespace NActors::NWorkStealing {
             ActivateSlot(slot);
 
             bool callbackCalled = false;
-            TExecuteCallback cb = [&](ui32) -> bool {
+            TExecuteCallback cb = [&](ui32, NHPTimer::STime&) -> bool {
                 callbackCalled = true;
                 return false;
             };

@@ -281,7 +281,8 @@ namespace NActors::NWorkStealing {
                 // After Inactive, no new Route() calls will target this slot.
                 while (auto item = worker.Slot->Pop()) {
                     if (worker.Callbacks.Execute) {
-                        worker.Callbacks.Execute(*item);
+                        NHPTimer::STime hpnow = GetCycleCountFast();
+                        worker.Callbacks.Execute(*item, hpnow);
                     }
                 }
 

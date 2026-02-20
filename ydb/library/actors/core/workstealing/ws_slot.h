@@ -4,11 +4,14 @@
 
 #include "mpmc_unbounded_queue.h"
 
+#include <util/system/hp_timer.h>
 #include <util/system/types.h>
 
 #include <atomic>
 #include <cstdint>
 #include <optional>
+
+namespace NActors { class TMailboxTable; }
 
 namespace NActors::NWorkStealing {
 
@@ -29,7 +32,7 @@ namespace NActors::NWorkStealing {
     // Scheduling slot for the work-stealing runtime.
     //
     // Each slot owns a TMPMCUnboundedQueue for activations.
-    // Any thread can Push/Pop activations; StealHalf pops a batch for stealers.
+    // Any thread can Push/Pop activations; Steal pops a budget-aware batch for stealers.
     //
     // State machine:
     //   Inactive -> Initializing  (driver assigns to worker)
@@ -57,8 +60,11 @@ namespace NActors::NWorkStealing {
 
         // --- Stealer API (any thread) ---
 
-        // Steal up to half the items from this slot's MPMC queue.
-        size_t StealHalf(ui32* out, size_t max);
+        // Steal activations from this slot's MPMC queue until the accumulated
+        // estimated cost reaches cyclesBudget or maxCount items are taken.
+        // When MailboxTable is set, uses per-mailbox avg cycles/event for cost.
+        // When MailboxTable is nullptr (tests), falls back to maxCount-limited.
+        size_t Steal(ui32* out, size_t maxCount, NHPTimer::STime cyclesBudget);
 
         // --- Metrics ---
 
@@ -70,6 +76,7 @@ namespace NActors::NWorkStealing {
         std::atomic<bool> WorkerSpinning{false};
         std::atomic<bool> Executing{false};   // true while inside executeCallback
         void* DriverData = nullptr;
+        NActors::TMailboxTable* MailboxTable = nullptr;  // set by pool init, used for cost-aware stealing
 
         // --- Stats ---
 

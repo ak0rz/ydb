@@ -36,7 +36,7 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            SetSimpleCallback(driver, slot, [](ui32) -> bool { return false; });
+            SetSimpleCallback(driver, slot, [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slot);
@@ -59,7 +59,7 @@ namespace NActors::NWorkStealing {
             driver.RegisterSlots(&slot, 1);
 
             std::atomic<int> counter{0};
-            SetSimpleCallback(driver, slot, [&counter](ui32) -> bool {
+            SetSimpleCallback(driver, slot, [&counter](ui32, NHPTimer::STime&) -> bool {
                 counter.fetch_add(1, std::memory_order_relaxed);
                 return false;
             });
@@ -97,7 +97,7 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            SetSimpleCallback(driver, slot, [](ui32) -> bool { return false; });
+            SetSimpleCallback(driver, slot, [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slot);
@@ -167,8 +167,8 @@ namespace NActors::NWorkStealing {
             TSlot slots[2];
             driver.RegisterSlots(slots, 2);
 
-            SetSimpleCallback(driver, slots[0], [](ui32) -> bool { return false; });
-            SetSimpleCallback(driver, slots[1], [](ui32) -> bool { return false; });
+            SetSimpleCallback(driver, slots[0], [](ui32, NHPTimer::STime&) -> bool { return false; });
+            SetSimpleCallback(driver, slots[1], [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slots[0]);
@@ -191,7 +191,7 @@ namespace NActors::NWorkStealing {
             driver.RegisterSlots(&slot, 1);
 
             std::atomic<int> counter{0};
-            SetSimpleCallback(driver, slot, [&counter](ui32) -> bool {
+            SetSimpleCallback(driver, slot, [&counter](ui32, NHPTimer::STime&) -> bool {
                 counter.fetch_add(1, std::memory_order_relaxed);
                 return false;
             });
@@ -232,7 +232,7 @@ namespace NActors::NWorkStealing {
             std::atomic<bool> setupCalled{false};
             std::atomic<bool> teardownCalled{false};
             TWorkerCallbacks callbacks;
-            callbacks.Execute = [](ui32) -> bool { return false; };
+            callbacks.Execute = [](ui32, NHPTimer::STime&) -> bool { return false; };
             callbacks.Setup = [&setupCalled]() {
                 setupCalled.store(true, std::memory_order_relaxed);
             };

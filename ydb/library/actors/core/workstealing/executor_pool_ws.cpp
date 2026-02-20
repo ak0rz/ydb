@@ -68,17 +68,21 @@ namespace NActors::NWorkStealing {
             Contexts_.push_back(std::make_unique<TWSExecutorContext>(i, actorSystem, this));
         }
 
+        // Wire MailboxTable onto each slot for cost-aware stealing
+        TMailboxTable* mboxTable = MailboxTable;
+        for (i16 i = 0; i < MaxSlotCount_; ++i) {
+            Slots_[i].MailboxTable = mboxTable;
+        }
+
         // Register all slots with the driver and wire per-worker callbacks
         if (Driver_) {
             Driver_->RegisterSlots(Slots_.data(), static_cast<size_t>(MaxSlotCount_));
-
-            TMailboxTable* mboxTable = MailboxTable;
             auto* pool = this;
             for (i16 i = 0; i < MaxSlotCount_; ++i) {
                 auto* ctx = Contexts_[i].get();
                 TWorkerCallbacks callbacks;
                 i16 slotIdx = i;
-                callbacks.Execute = [ctx, mboxTable, pool, slotIdx](ui32 hint) -> bool {
+                callbacks.Execute = [ctx, mboxTable, pool, slotIdx](ui32 hint, NHPTimer::STime& hpnow) -> bool {
                     TMailbox* mailbox = mboxTable->Get(hint);
                     if (!mailbox) {
                         return false;
@@ -87,7 +91,7 @@ namespace NActors::NWorkStealing {
                     CurrentlyExecutingMailbox = mailbox;
                     DeferredReinjection = nullptr;
 
-                    bool processed = ctx->ExecuteSingleEvent(mailbox);
+                    bool processed = ctx->ExecuteSingleEvent(mailbox, hpnow);
 
                     // Stamp affinity BEFORE any unlock — after unlock another
                     // thread may read LastPoolSlotIdx via RouteActivation.

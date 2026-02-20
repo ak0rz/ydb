@@ -31,13 +31,12 @@ namespace NActors::NWorkStealing {
         TlsThreadContext = nullptr;
     }
 
-    bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox) {
+    bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
         std::unique_ptr<IEventHandle> ev = mailbox->Pop();
         if (!ev) {
             return false;
         }
 
-        NHPTimer::STime hpnow = GetCycleCountFast();
         NHPTimer::STime hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
         ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
 
