@@ -189,6 +189,10 @@ namespace NActors::NWorkStealing {
             return;
         }
 
+        if (auto* stats = MailboxTable->GetStats(mailbox->Hint)) {
+            stats->ActivationCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
         int slotIdx = Router_->Route(mailbox->Hint, mailbox->LastPoolSlotIdx);
 
         // Wake only the worker owning the target slot.

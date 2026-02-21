@@ -94,9 +94,6 @@ namespace NActors::NWorkStealing {
                 auto prevMax = mboxStats->MaxExecutionCycles.load(std::memory_order_relaxed);
                 if (static_cast<ui64>(eventCycles) > prevMax)
                     mboxStats->MaxExecutionCycles.store(eventCycles, std::memory_order_relaxed);
-                auto prevMin = mboxStats->MinExecutionCycles.load(std::memory_order_relaxed);
-                if (static_cast<ui64>(eventCycles) < prevMin)
-                    mboxStats->MinExecutionCycles.store(eventCycles, std::memory_order_relaxed);
 
                 mboxStats->LastExecutionEndCycles.store(hpnow, std::memory_order_relaxed);
             }

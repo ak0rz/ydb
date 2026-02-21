@@ -279,7 +279,7 @@ namespace NActors {
         EventsProcessed.store(0, std::memory_order_relaxed);
         TotalExecutionCycles.store(0, std::memory_order_relaxed);
         MaxExecutionCycles.store(0, std::memory_order_relaxed);
-        MinExecutionCycles.store(Max<ui64>(), std::memory_order_relaxed);
+        ActivationCount.store(0, std::memory_order_relaxed);
         LastExecutionEndCycles.store(0, std::memory_order_relaxed);
         TotalIdleCycles.store(0, std::memory_order_relaxed);
         MaxIdleCycles.store(0, std::memory_order_relaxed);

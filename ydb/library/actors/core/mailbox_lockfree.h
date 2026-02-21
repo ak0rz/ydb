@@ -239,7 +239,7 @@ namespace NActors {
         std::atomic<ui64> EventsProcessed{0};
         std::atomic<ui64> TotalExecutionCycles{0};
         std::atomic<ui64> MaxExecutionCycles{0};
-        std::atomic<ui64> MinExecutionCycles{Max<ui64>()};
+        std::atomic<ui64> ActivationCount{0};
         std::atomic<ui64> LastExecutionEndCycles{0};
         std::atomic<ui64> TotalIdleCycles{0};
         std::atomic<ui64> MaxIdleCycles{0};
