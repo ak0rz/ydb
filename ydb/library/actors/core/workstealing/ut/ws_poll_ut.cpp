@@ -126,9 +126,9 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT(!item.has_value());
         }
 
-        Y_UNIT_TEST(BudgetExhaustedLeavesWorkInQueue) {
-            // With MaxExecBatch=2 and 5 events, PollSlot processes 2
-            // and leaves the activation in the queue.
+        Y_UNIT_TEST(BudgetExhaustedSavesHotContinuation) {
+            // With MaxExecBatch=2 and unlimited events, PollSlot processes 2
+            // and saves the activation as a hot continuation (not in queue).
             TSlot slot;
             ActivateSlot(slot);
 
@@ -148,10 +148,11 @@ namespace NActors::NWorkStealing {
             UNIT_ASSERT_EQUAL(result, EPollResult::Busy);
             UNIT_ASSERT_VALUES_EQUAL(callCount, 2u);
 
-            // The activation should still be in the queue (pushed back)
+            // The activation should be in HotContinuation, NOT the queue
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*ps.HotContinuation, 7u);
             auto item = slot.Pop();
-            UNIT_ASSERT(item.has_value());
-            UNIT_ASSERT_VALUES_EQUAL(*item, 7u);
+            UNIT_ASSERT(!item.has_value());
         }
 
         Y_UNIT_TEST(InterleavedActivations) {
@@ -399,6 +400,154 @@ namespace NActors::NWorkStealing {
             EPollResult r3 = PollSlot(slotA, &iter, cb, config, ps);
             UNIT_ASSERT_EQUAL(r3, EPollResult::Busy);
             UNIT_ASSERT(slotA.Counters.StealAttempts.load(std::memory_order_relaxed) > 0);
+        }
+
+        Y_UNIT_TEST(HotContinuationPreservesActivation) {
+            // When a hot mailbox (A with 200 events) exhausts execBudget,
+            // it is saved as a continuation and served FIRST on the next
+            // PollSlot call — before B which is waiting in the queue.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{10, 200}, {20, 1}};
+            auto cb = MakeCallback(executed, remaining);
+
+            slot.Push(10);
+            slot.Push(20);
+
+            TWsConfig config;
+            config.MaxExecBatch = 10;
+            TPollState ps;
+
+            // First PollSlot: no continuation yet. Phase 2 pops mailbox 10,
+            // processes 10 events, budget exhausted, saves as continuation.
+            // Mailbox 20 stays in queue.
+            EPollResult r1 = PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT_EQUAL(r1, EPollResult::Busy);
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*ps.HotContinuation, 10u);
+            // All executed so far should be from mailbox 10
+            for (ui32 h : executed) {
+                UNIT_ASSERT_VALUES_EQUAL(h, 10u);
+            }
+            size_t firstBatch = executed.size();
+
+            // Second PollSlot: phase 1 serves continuation (mailbox 10)
+            // with capped budget, then phase 2 serves mailbox 20 from queue.
+            EPollResult r2 = PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT_EQUAL(r2, EPollResult::Busy);
+            // Verify mailbox 10 was served first in this batch (phase 1)
+            UNIT_ASSERT_VALUES_EQUAL(executed[firstBatch], 10u);
+            // Verify mailbox 20 was also served (phase 2 interleaving)
+            bool saw20 = false;
+            for (size_t i = firstBatch; i < executed.size(); ++i) {
+                if (executed[i] == 20) saw20 = true;
+            }
+            UNIT_ASSERT(saw20);
+        }
+
+        Y_UNIT_TEST(ContinuationClearsWhenDrained) {
+            // When a mailbox drains during a continuation, no continuation
+            // is saved afterwards.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{10, 5}};
+            auto cb = MakeCallback(executed, remaining);
+
+            slot.Push(10);
+
+            TWsConfig config;
+            config.MaxExecBatch = 3;
+            TPollState ps;
+
+            // First PollSlot: processes 3, saves continuation (2 remain).
+            EPollResult r1 = PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT_EQUAL(r1, EPollResult::Busy);
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(executed.size(), 3u);
+
+            // Second PollSlot: processes remaining 2, drains mailbox.
+            EPollResult r2 = PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT_EQUAL(r2, EPollResult::Busy);
+            UNIT_ASSERT_VALUES_EQUAL(executed.size(), 5u);
+            // No continuation should remain
+            UNIT_ASSERT(!ps.HotContinuation.has_value());
+        }
+
+        Y_UNIT_TEST(ContinuationDoesNotStarveQueue) {
+            // Even with a hot continuation, queue items must get processed.
+            // This prevents system-wide stall when fan-in actors >= slots.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{10, 1000}, {20, 1}, {30, 1}};
+            auto cb = MakeCallback(executed, remaining);
+
+            // First PollSlot: establish continuation for mailbox 10
+            slot.Push(10);
+            TWsConfig config;
+            config.MaxExecBatch = 10;
+            TPollState ps;
+            PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*ps.HotContinuation, 10u);
+
+            // Now push queue items while continuation is active
+            slot.Push(20);
+            slot.Push(30);
+
+            // Second PollSlot: continuation runs in phase 1 (capped),
+            // then phase 2 must serve 20 and 30.
+            executed.clear();
+            PollSlot(slot, nullptr, cb, config, ps);
+
+            // Both queue items must have been served
+            bool saw20 = false, saw30 = false;
+            for (ui32 h : executed) {
+                if (h == 20) saw20 = true;
+                if (h == 30) saw30 = true;
+            }
+            UNIT_ASSERT_C(saw20, "Queue item 20 was starved by continuation");
+            UNIT_ASSERT_C(saw30, "Queue item 30 was starved by continuation");
+            // Continuation should still be active
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*ps.HotContinuation, 10u);
+        }
+
+        Y_UNIT_TEST(ContinuationFlushedToQueue) {
+            // When a continuation is set but we need to flush it (e.g.
+            // before parking), pushing it to the queue makes it available.
+            TSlot slot;
+            ActivateSlot(slot);
+
+            std::vector<ui32> executed;
+            std::map<ui32, ui32> remaining = {{10, 100}};
+            auto cb = MakeCallback(executed, remaining);
+
+            slot.Push(10);
+
+            TWsConfig config;
+            config.MaxExecBatch = 3;
+            TPollState ps;
+
+            // Build up a continuation
+            PollSlot(slot, nullptr, cb, config, ps);
+            UNIT_ASSERT(ps.HotContinuation.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*ps.HotContinuation, 10u);
+
+            // Simulate flush: push continuation to queue and clear
+            slot.Push(*ps.HotContinuation);
+            ps.HotContinuation.reset();
+
+            // Verify the activation is now in the queue
+            auto item = slot.Pop();
+            UNIT_ASSERT(item.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(*item, 10u);
+            UNIT_ASSERT(!ps.HotContinuation.has_value());
         }
 
     } // Y_UNIT_TEST_SUITE(WsPoll)

@@ -265,6 +265,14 @@ namespace NActors::NWorkStealing {
                     continue;
                 }
 
+                // Flush hot continuation before Dekker check — the mailbox
+                // must be visible in the queue before we announce not-spinning.
+                if (pollState.HotContinuation) {
+                    worker.Slot->Push(*pollState.HotContinuation);
+                    pollState.HotContinuation.reset();
+                    continue;  // re-enter loop to process it
+                }
+
                 // Queue appears empty. Dekker: announce not-spinning, re-check
                 // for items from in-flight Route() calls that saw Active before
                 // the transition.
@@ -329,6 +337,13 @@ namespace NActors::NWorkStealing {
             {
                 ui64 now = GetCycleCountFast();
                 if (now - lastLocalWorkTs > spinThreshold) {
+                    // Flush hot continuation before parking — push it to the
+                    // queue so it's visible to WakeSlot's HasWork() check.
+                    if (pollState.HotContinuation) {
+                        worker.Slot->Push(*pollState.HotContinuation);
+                        pollState.HotContinuation.reset();
+                    }
+
                     // Dekker protocol: announce intent to park, then re-check.
                     // Paired with seq_cst load in WakeSlot. Either:
                     //  - WakeSlot sees WorkerSpinning=false → calls Unpark
@@ -354,6 +369,12 @@ namespace NActors::NWorkStealing {
                     spinThreshold = Config_.MinSpinThresholdCycles;
                 }
             }
+        }
+
+        // Flush any remaining hot continuation before shutdown.
+        if (pollState.HotContinuation) {
+            worker.Slot->Push(*pollState.HotContinuation);
+            pollState.HotContinuation.reset();
         }
 
         worker.Slot->WorkerSpinning.store(false, std::memory_order_release);

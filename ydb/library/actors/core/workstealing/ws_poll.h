@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 
 namespace NActors::NWorkStealing {
 
@@ -40,28 +41,45 @@ namespace NActors::NWorkStealing {
     // calls — one GetCycleCountFast() per event total.
     using TExecuteCallback = std::function<bool(ui32 hint, NHPTimer::STime& hpnow)>;
 
-    // Per-slot state for polling. Tracks consecutive idle polls to
-    // control steal frequency (backoff).
+    // Per-slot polling state, persists across PollSlot calls within a worker.
+    //
+    // Tracks steal backoff (ConsecutiveIdle, NextStealAtIdle, StealInterval)
+    // and the hot continuation — a mailbox that exhausted Phase 2's event
+    // budget while still having work. The continuation receives priority
+    // processing on the next PollSlot call (Phase 1).
+    //
+    // INVARIANT: A mailbox in HotContinuation is still locked. The worker
+    // MUST flush it (push to queue) before parking, draining, or shutting
+    // down. See thread_driver.cpp for flush points.
     struct TPollState {
         uint32_t ConsecutiveIdle = 0;
         uint32_t NextStealAtIdle = 0; // next ConsecutiveIdle value at which to attempt stealing
         uint32_t StealInterval = 0;   // current interval between steal attempts (exponential backoff)
         bool HadLocalWork = false;    // set by PollSlot: true = local work executed, false = stolen or idle
+        std::optional<ui32> HotContinuation; // Phase 2 leftover: activation that still has events
     };
 
-    // Core polling routine for a single slot.
+    // Core polling routine for a single slot. Two-phase execution with
+    // one-shot hot continuation and time-based batching.
     //
-    // Algorithm:
-    // 1. Pop activations from our MPMC queue
-    //    - Process events from each mailbox for up to MailboxBatchCycles
-    //    - If callback returns true after time budget: push hint back
-    //    - Overall budget (MaxExecBatch) is per-event, checked each iteration
-    //    - Return Busy if any work was done
-    // 2. No local work: try stealing from neighbors via stealIterator
-    //    - Steal into stack buffer (budget-aware, no reinjection)
-    //    - Execute directly from the steal buffer
-    //    - Return Busy if any work was done
-    // 3. Nothing found anywhere: return Idle
+    // Phase 1 — Hot continuation (one-shot):
+    //   If HotContinuation is set, process it first with a fresh
+    //   MaxExecBatch budget. If it still has events, push to queue
+    //   (NOT saved back as continuation). Gives priority to hot
+    //   mailboxes without monopolizing Phase 1 across calls.
+    //
+    // Phase 2 — Queue processing:
+    //   Pop activations and execute with a separate MaxExecBatch budget.
+    //   Each mailbox runs for up to MailboxBatchCycles before checking
+    //   the queue for interleaving. If budget is exhausted while a
+    //   mailbox still has events, it becomes the next HotContinuation.
+    //
+    // Stealing:
+    //   If both phases found no work, try stealing from neighbors via
+    //   stealIterator with exponential backoff. Stolen items are
+    //   executed directly from a stack buffer (no reinjection).
+    //
+    // Returns Busy if any event was processed, Idle otherwise.
     EPollResult PollSlot(
         TSlot& slot,
         IStealIterator* stealIterator,

@@ -16,6 +16,7 @@ namespace NActors::NWorkStealing {
         uint64_t DrainedItems = 0;
         uint64_t Parks = 0;
         uint64_t Wakes = 0;
+        uint64_t HotContinuations = 0;
 
         void Add(const TWsSlotCountersSnapshot& other) {
             Executions += other.Executions;
@@ -26,14 +27,16 @@ namespace NActors::NWorkStealing {
             DrainedItems += other.DrainedItems;
             Parks += other.Parks;
             Wakes += other.Wakes;
+            HotContinuations += other.HotContinuations;
         }
 
         void Dump(const char* label) const {
             std::fprintf(stderr,
                          "# [%s] exec=%lu drained=%lu stolen=%lu "
-                         "steal_att=%lu idle=%lu busy=%lu parks=%lu wakes=%lu\n",
+                         "steal_att=%lu idle=%lu busy=%lu parks=%lu wakes=%lu hot_cont=%lu\n",
                          label, Executions, DrainedItems, StolenItems,
-                         StealAttempts, IdlePolls, BusyPolls, Parks, Wakes);
+                         StealAttempts, IdlePolls, BusyPolls, Parks, Wakes,
+                         HotContinuations);
         }
     };
 
@@ -50,6 +53,7 @@ namespace NActors::NWorkStealing {
         std::atomic<uint64_t> DrainedItems{0};
         std::atomic<uint64_t> Parks{0};
         std::atomic<uint64_t> Wakes{0};
+        std::atomic<uint64_t> HotContinuations{0};
 
         void Reset() {
             Executions.store(0, std::memory_order_relaxed);
@@ -60,6 +64,7 @@ namespace NActors::NWorkStealing {
             DrainedItems.store(0, std::memory_order_relaxed);
             Parks.store(0, std::memory_order_relaxed);
             Wakes.store(0, std::memory_order_relaxed);
+            HotContinuations.store(0, std::memory_order_relaxed);
         }
 
         TWsSlotCountersSnapshot Snapshot() const {
@@ -72,6 +77,7 @@ namespace NActors::NWorkStealing {
                 DrainedItems.load(std::memory_order_relaxed),
                 Parks.load(std::memory_order_relaxed),
                 Wakes.load(std::memory_order_relaxed),
+                HotContinuations.load(std::memory_order_relaxed),
             };
         }
     };
