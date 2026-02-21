@@ -53,6 +53,14 @@ namespace {
         return result;
     }
 
+    // Burn CPU for a calibrated number of iterations (~1 iter ≈ 1 ns on modern CPUs)
+    Y_NO_INLINE void BusyWork(ui64 iterations) {
+        volatile ui64 x = 0;
+        for (ui64 i = 0; i < iterations; ++i) {
+            x += i * 7 + 1;
+        }
+    }
+
     // Global overrides (0 = use default from TWsConfig)
     ui64 GSpinThresholdCycles = 0;
     ui64 GMinSpinThresholdCycles = 0;
@@ -317,6 +325,93 @@ namespace {
     };
 
     // -------------------------------------------------------------------
+    // Pipeline scenario: N independent linear pipelines, each with S stages
+    //
+    // Tests scheduling of dependent sequential processing stages where
+    // multiple stages may be hot simultaneously on the same slot.
+    // Unlike chain (circular ring with one message), pipeline has
+    // continuous injection — multiple items in-flight per pipeline.
+    //
+    //   Source → Stage[0] → Stage[1] → ... → Stage[S-1] → Sink
+    //     ↻ (self-loop)                                   (counter++)
+    //
+    // Each stage does configurable BusyWork before forwarding.
+    // Source self-loops to keep the pipeline fed continuously.
+    // -------------------------------------------------------------------
+
+    class TPipelineSource: public NActors::TActor<TPipelineSource> {
+    public:
+        TPipelineSource(NActors::TActorId firstStage, std::atomic<bool>& stop)
+            : TActor(&TPipelineSource::StateFunc)
+            , FirstStage_(firstStage)
+            , Stop_(stop)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvBenchMsg, Handle);
+            }
+        }
+
+    private:
+        void Handle(TEvBenchMsg::TPtr& /*ev*/) {
+            if (Stop_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            Send(FirstStage_, new TEvBenchMsg());
+            Send(SelfId(), new TEvBenchMsg());
+        }
+
+        NActors::TActorId FirstStage_;
+        std::atomic<bool>& Stop_;
+    };
+
+    class TPipelineStage: public NActors::TActor<TPipelineStage> {
+    public:
+        TPipelineStage(NActors::TActorId next, ui64 workIters)
+            : TActor(&TPipelineStage::StateFunc)
+            , Next_(next)
+            , WorkIters_(workIters)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvBenchMsg, Handle);
+            }
+        }
+
+    private:
+        void Handle(TEvBenchMsg::TPtr& /*ev*/) {
+            BusyWork(WorkIters_);
+            Send(Next_, new TEvBenchMsg());
+        }
+
+        NActors::TActorId Next_;
+        ui64 WorkIters_;
+    };
+
+    class TPipelineSink: public NActors::TActor<TPipelineSink> {
+    public:
+        TPipelineSink(std::atomic<ui64>& counter)
+            : TActor(&TPipelineSink::StateFunc)
+            , Counter_(counter)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvBenchMsg, Handle);
+            }
+        }
+
+    private:
+        void Handle(TEvBenchMsg::TPtr& /*ev*/) {
+            Counter_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        std::atomic<ui64>& Counter_;
+    };
+
+    // -------------------------------------------------------------------
     // Storage-node scenario: models YDB VDisk actor patterns under load
     //
     // Actors:
@@ -354,14 +449,6 @@ namespace {
     struct TEvCompactionTick: NActors::TEventLocal<TEvCompactionTick, 10705> {};
     struct TEvCompactionTask: NActors::TEventLocal<TEvCompactionTask, 10706> {};
     struct TEvCompactionDone: NActors::TEventLocal<TEvCompactionDone, 10707> {};
-
-    // Burn CPU for a calibrated number of iterations (~1 iter ≈ 1 ns on modern CPUs)
-    Y_NO_INLINE void BusyWork(ui64 iterations) {
-        volatile ui64 x = 0;
-        for (ui64 i = 0; i < iterations; ++i) {
-            x += i * 7 + 1;
-        }
-    }
 
     // Parameters for storage-node scenario
     struct TStorageNodeParams {
@@ -867,6 +954,73 @@ namespace {
         };
     }
 
+    TBenchResult RunPipeline(const TString& poolType, ui32 threads, ui32 pipelines,
+                             ui32 stages, ui64 stageWork,
+                             ui32 warmupSec, ui32 durationSec) {
+        auto setup = (poolType == "ws") ? MakeWSSetup(threads, GSpinThresholdCycles) : MakeBasicSetup(threads);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = BenchPoolId(poolType);
+
+        std::atomic<ui64> counter{0};
+        std::atomic<bool> stop{false};
+
+        for (ui32 i = 0; i < pipelines; ++i) {
+            // Build pipeline backwards: sink → stages → source
+            auto* sink = new TPipelineSink(counter);
+            NActors::TActorId nextId = sys.Register(sink, NActors::TMailboxType::HTSwap, pool);
+
+            for (ui32 s = 0; s < stages; ++s) {
+                auto* stage = new TPipelineStage(nextId, stageWork);
+                nextId = sys.Register(stage, NActors::TMailboxType::HTSwap, pool);
+            }
+
+            auto* source = new TPipelineSource(nextId, stop);
+            NActors::TActorId sourceId = sys.Register(source, NActors::TMailboxType::HTSwap, pool);
+            sys.Send(sourceId, new TEvBenchMsg());
+        }
+
+        // Warmup
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        counter.store(0, std::memory_order_relaxed);
+        ResetWsCounters();
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+
+        ui64 ops = counter.load(std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+
+        double opsPerSec = (elapsed > 0) ? (double)ops / elapsed : 0;
+        double avgLatencyUs = (ops > 0) ? (elapsed * 1e6 / ops) : 0;
+
+        char label[128];
+        std::snprintf(label, sizeof(label), "%s/pipeline t=%u p=%u s=%u w=%lu",
+                      poolType.c_str(), threads, pipelines, stages, stageWork);
+        DumpWsCounters(label);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        sys.Stop();
+
+        return TBenchResult{
+            .PoolType = poolType,
+            .Scenario = "pipeline",
+            .Threads = threads,
+            .ActorPairs = pipelines,
+            .OpsPerSec = opsPerSec,
+            .AvgLatencyUs = avgLatencyUs,
+            .CpuSeconds = cpuAfter - cpuBefore,
+            .WallSeconds = elapsed,
+        };
+    }
+
     TBenchResult RunStorageNode(const TString& poolType, ui32 threads,
                                 const TStorageNodeParams& params,
                                 ui32 warmupSec, ui32 durationSec) {
@@ -963,7 +1117,7 @@ int main(int argc, const char* argv[]) {
         .StoreResult(&poolType);
 
     TString scenario = "all";
-    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, storage-node, or all")
+    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, storage-node, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -1038,6 +1192,17 @@ int main(int argc, const char* argv[]) {
         .DefaultValue("50")
         .StoreResult(&compactionPeriodMs);
 
+    // Pipeline scenario parameters
+    ui32 pipelineStages = 4;
+    opts.AddLongOption("stages", "Number of processing stages per pipeline")
+        .DefaultValue("4")
+        .StoreResult(&pipelineStages);
+
+    ui64 stageWorkIters = 100;
+    opts.AddLongOption("stage-work", "CPU iterations per pipeline stage (~1 iter = 1 ns)")
+        .DefaultValue("100")
+        .StoreResult(&stageWorkIters);
+
     NLastGetopt::TOptsParseResult res(&opts, argc, argv);
 
     GSpinThresholdCycles = spinThreshold;
@@ -1065,7 +1230,7 @@ int main(int argc, const char* argv[]) {
 
     std::vector<TString> scenarios;
     if (scenario == "all") {
-        scenarios = {"ping-pong", "star", "chain", "reincarnation", "storage-node"};
+        scenarios = {"ping-pong", "star", "chain", "reincarnation", "pipeline", "storage-node"};
     } else {
         scenarios = {scenario};
     }
@@ -1081,6 +1246,16 @@ int main(int argc, const char* argv[]) {
                     auto result = RunStorageNode(pt, t, storageParams, warmupSec, durationSec);
                     result.PrintCSV();
                     std::fflush(stdout);
+                }
+            } else if (sc == "pipeline") {
+                // Pipeline uses pairs as pipeline count, plus stages/stage-work
+                for (ui32 p : pairs) {
+                    for (const auto& pt : poolTypes) {
+                        auto result = RunPipeline(pt, t, p, pipelineStages, stageWorkIters,
+                                                  warmupSec, durationSec);
+                        result.PrintCSV();
+                        std::fflush(stdout);
+                    }
                 }
             } else {
                 for (ui32 p : pairs) {
