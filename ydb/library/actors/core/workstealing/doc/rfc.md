@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented (Steps 0-16 complete, plus post-v1 optimizations). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-2.8× faster on ping-pong, 1.4-1.9× on star, 1.2-2.6× on chain for the best configurations. See Section 11 for full results.
+Implemented (Steps 0-16 complete, plus post-v1 optimizations including hot continuation). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-2.8× faster on ping-pong, 1.4-1.9× on star, 1.2-2.6× on chain for the best configurations. See Section 11 for full results.
 
 ## 1. Problem Statement
 
@@ -87,34 +87,134 @@ stateDiagram-v2
 
 ### Polling Routine
 
-The core loop executed by each worker for each assigned slot. Uses a **time-based batched execution model**: process events from a single mailbox for up to `MailboxBatchCycles` (default ~17μs at 3GHz) before pushing the activation back, then move to the next activation.
+The core loop executed by each worker for each assigned slot. Uses a **two-phase execution model** with **one-shot hot continuation** and **time-based batching**.
+
+- **Phase 1 (one-shot):** If a hot continuation was saved from the previous PollSlot call, process it first with a fresh `MaxExecBatch` budget. The continuation gets a priority run but is NOT saved back — if it can't drain within the budget, it's pushed to the queue for fair interleaving. This gives hot mailboxes priority without monopolization. See [Hot Continuation](#hot-continuation-one-shot) for the full motivation.
+
+- **Phase 2 (queue):** Pop activations from the MPMC queue and execute with a separate `MaxExecBatch` budget. Each mailbox runs for up to `MailboxBatchCycles` (~17μs at 3GHz). When the time slice expires, check the queue inline: if other work is waiting, swap activations (push current, pop next); if empty, reset the deadline and continue the same mailbox. If Phase 2 exhausts its budget while a mailbox still has events, that mailbox is saved as the hot continuation for the next PollSlot call.
+
+- **Stealing:** If both phases found no work, try stealing from neighbor slots with exponential backoff. Stolen items are executed directly from a stack buffer (no reinjection into the queue).
 
 ```mermaid
 flowchart TD
-    START([PollSlot]) --> POP
+    START([PollSlot]) --> CONT{Hot<br/>continuation?}
 
-    POP{MPMC queue<br/>pop?} -->|activation| BATCH[Execute batch:<br/>process events for up to<br/>MailboxBatchCycles]
-    BATCH --> DONE{Mailbox<br/>drained?}
-    DONE -->|no, time budget expired| PUSH[Push activation<br/>back to queue]
-    DONE -->|yes, mailbox finalized| BUDGET
-    PUSH --> BUDGET{Exec budget<br/>remaining?}
-    BUDGET -->|yes| POP
-    BUDGET -->|no| BUSY(["Return Busy"])
+    CONT -->|yes| P1["<b>Phase 1 (one-shot)</b><br/>Execute with own<br/>MaxExecBatch budget"]
+    P1 --> P1DONE{Mailbox<br/>drained?}
+    P1DONE -->|no| P1PUSH["Push to queue tail<br/><i>(not saved as continuation)</i>"]
+    P1DONE -->|yes| P2START
+    P1PUSH --> P2START
 
-    POP -->|empty| STEAL{Steal-half<br/>from neighbors?}
-    STEAL -->|stolen items| PUSH_STOLEN[Push stolen items<br/>into our queue]
-    PUSH_STOLEN --> EXEC_STOLEN[Pop and execute<br/>with same batch model]
-    EXEC_STOLEN --> BUSY_STOLEN(["Return Busy"])
-    STEAL -->|nothing| IDLE([Return Idle])
+    CONT -->|no| P2START
+    P2START["<b>Phase 2</b><br/>Fresh MaxExecBatch budget"] --> POP
+
+    POP{Pop from<br/>queue?} -->|activation| EXEC["Execute events for<br/>up to MailboxBatchCycles"]
+    EXEC --> DRAIN{Mailbox<br/>drained?}
+    DRAIN -->|yes| BUDGET
+    DRAIN -->|no, deadline hit| PEEK{Queue has<br/>other work?}
+    PEEK -->|yes| SWAP["Push current,<br/>pop next"]
+    PEEK -->|no| RESET["Reset deadline,<br/>continue same mailbox"]
+    SWAP --> EXEC
+    RESET --> EXEC
+
+    BUDGET{Budget<br/>remaining?} -->|yes| POP
+    DRAIN -->|no, budget exhausted| SAVE
+    BUDGET -->|no, activation live| SAVE
+
+    SAVE["Save as<br/>HotContinuation"] --> BUSY(["Return Busy"])
+    BUDGET -->|no, drained| BUSY
+
+    POP -->|empty| STEAL{Steal from<br/>neighbors?}
+    STEAL -->|found items| EXEC_STOLEN["Execute directly<br/>from steal buffer"]
+    EXEC_STOLEN --> BUSY2(["Return Busy"])
+    STEAL -->|nothing| IDLE(["Return Idle"])
 ```
 
 **Key details:**
-- **Time-based batching:** Each mailbox gets up to `MailboxBatchCycles` of processing time per pop/push cycle. This amortizes MPMC queue push/pop overhead for hot mailboxes (critical for star/fan-in patterns) while still interleaving activations fairly. The time check uses `GetCycleCountFast()` (rdtsc).
-- **Overall budget:** `MaxExecBatch` (default 64) caps total events per `PollSlot` call across all mailboxes.
-- **Push-back model:** After the batch time expires, the activation hint is pushed back into the slot's MPMC queue. This naturally interleaves activations and prevents starvation where self-sending actors could monopolize a worker.
-- **Stolen items** are pushed into the local MPMC queue, then popped and executed with the same batched model.
+- **Two-phase budgets:** Phase 1 and Phase 2 each get `MaxExecBatch` (default 64) events. The hot continuation gets priority without starving queue activations, and total work per PollSlot is bounded at 2 × `MaxExecBatch`.
+- **Inline interleaving:** Phase 2 checks the queue when a mailbox's time slice expires. If another activation is waiting, it swaps without leaving the inner loop. If empty, the deadline resets and the same mailbox continues — avoiding unnecessary MPMC push/pop overhead and false steal potential.
+- **Direct steal execution:** Stolen items are executed directly from a stack buffer on the stealer's stack. Only items that still have events after execution are pushed to the local queue. This avoids re-steal races.
 - `HadLocalWork` flag distinguishes local work from stolen work, used by the Worker loop for parking decisions.
-- Before calling `StealHalf` on a victim, the stealer checks `SizeEstimate() == 0` and `Executing == false` and skips empty/idle victims.
+- Before probing a victim, the stealer checks `SizeEstimate() == 0` and `Executing == false` and skips empty/idle slots.
+
+### Hot Continuation (One-Shot)
+
+#### Problem: Fan-In Budget Exhaustion
+
+In fan-in workloads (N senders → 1 receiver), the receiver mailbox accumulates events faster than PollSlot can drain them. When `MaxExecBatch` (64 events) is exhausted while the receiver still has work, the original (pre-continuation) approach pushed the activation to the **end** of the slot's MPMC queue:
+
+```
+Before: PollSlot exhausts budget on receiver (R)
+Queue state: [S1, S2, S3, ..., SN]
+             ← R pushed here →  [S1, S2, S3, ..., SN, R]
+```
+
+With N senders on the same slot, R waits behind all of them before getting another turn. Each sender generates one more event for R, so when R finally runs again, it has N new events but the same 64-event budget. Effective receiver throughput drops to roughly `1/(N+1)` of slot capacity.
+
+For cheap events (~100 cycles, e.g. star receiver doing `counter++`), the 64-event budget is exhausted after ~6,400 cycles — well before the 50,000-cycle `MailboxBatchCycles` deadline. The push-to-tail is the bottleneck, not time-based interleaving.
+
+#### Attempt 1: Persistent Continuation
+
+First fix: save the hot mailbox in `TPollState::HotContinuation` across PollSlot calls. Each call starts by processing the continuation first, then saves it back if it still has work.
+
+**Result:** Star 4t/10p improved from 157K to 228K (+45%). But star 8t/10p **regressed** from 303K to 71K — a 4× slowdown.
+
+**Root cause — synchronized contention:** Persistent continuation forces all workers to start each PollSlot with their sender continuation (Phase 1). All senders execute simultaneously and call `Send(receiver, msg)`, which routes to `slot.Push(receiverHint)`. With 8 workers doing this in lockstep:
+
+```
+Worker 0: Phase1(sender_0) → Send(receiver) → slot[R].Push(hint) ──┐
+Worker 1: Phase1(sender_1) → Send(receiver) → slot[R].Push(hint) ──┤ 8 concurrent
+Worker 2: Phase1(sender_2) → Send(receiver) → slot[R].Push(hint) ──┤ CAS operations
+  ...                                                               │ on same cache line
+Worker 7: Phase1(sender_7) → Send(receiver) → slot[R].Push(hint) ──┘
+```
+
+Each `Push` is a `fetch_add` on the MPMC queue's tail counter. Under 8-way contention, the cache line bounces between L1 caches, inflating per-event cost from ~700 cycles (uncontended) to ~6,000 cycles. The `MailboxBatchCycles` deadline (50,000 cycles) is hit after only ~8 events instead of 64, wasting 87% of the event budget.
+
+Diagnostic counters confirmed this: `Phase1Deadlines ≈ BusyPolls` (virtually every Phase 1 hit the time deadline), and `Phase1Execs / BusyPolls ≈ 8` (only 8 events per Phase 1, not 64).
+
+#### Solution: One-Shot Continuation
+
+Phase 1 consumes the continuation but does **not** save it back. If the mailbox still has events after Phase 1's budget, it's pushed to the queue — where Phase 2 and other activations interleave fairly. Only Phase 2's leftover (if any) becomes the next continuation.
+
+```
+PollSlot call N:
+  Phase 1: Execute continuation (sender_k), push back to queue
+  Phase 2: Pop sender_k, sender_j, receiver, ... (interleaved)
+           Last activation exhausts budget → saved as continuation
+
+PollSlot call N+1:
+  Phase 1: Execute that continuation (one-shot, not saved back)
+  Phase 2: ...
+```
+
+This breaks the synchronization because:
+1. **Phase 1 is brief** — one budget of the saved continuation, then it's done.
+2. **Workers desynchronize in Phase 2** — they enter Phase 2 at different times, process different queue depths, and generate receiver events at staggered intervals rather than simultaneously.
+3. **Self-balancing** — when the hot mailbox drains completely, no continuation is saved. The next PollSlot starts directly with Phase 2. The continuation mechanism only engages when there's actual sustained load.
+
+#### Flush Invariants
+
+A locked mailbox must never be abandoned in `HotContinuation`. The worker must flush it (push to queue) before:
+
+1. **Draining** (slot transitioning to `Inactive`): push before Dekker `WorkerSpinning=false` so `HasWork()` sees it
+2. **Parking** (spin timeout): push before Dekker protocol
+3. **Shutdown** (worker loop exit): push before teardown
+
+See `thread_driver.cpp:WorkerLoop()` for the three flush points.
+
+#### Benchmark Results
+
+| Config | Basic | WS (persistent) | WS (one-shot) |
+|--------|-------|-----------------|---------------|
+| Star 4t/10p | 157K | 228K (+45%) | 228K (+45%) |
+| Star 4t/100p | 14.9K | — | 25.9K (+74%) |
+| Star 8t/10p | 319K | **71K (−78%)** | 336K (+5%) |
+| Star 8t/100p | 27.7K | — | 42.0K (+52%) |
+| Ping-pong 4t/10p | 762K | — | 1.04M (+37%) |
+| Ping-pong 8t/10p | 1.44M | — | 2.07M (+44%) |
+
+One-shot eliminates the 8t regression while preserving the fan-in improvement at all thread counts.
 
 ### Activation Routing
 
@@ -378,7 +478,7 @@ Storage Performance Development Kit uses pollers (non-blocking poll functions) a
 
 ## 11. Implementation Summary
 
-All 17 steps are complete. 132 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
+All 17 steps are complete. 136 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
 
 ```
 Step 0  Contention Analysis           ✓
@@ -410,6 +510,7 @@ Step 16 System-level A/B Benchmarks   ✓ (ping-pong, star, chain; CSV + CPU uti
 5. **Single-event execution with push-back** (Step 7/16): Replaced batch-then-reinject model with single-event callback + push-back. Prevents self-send starvation.
 6. **Time-based mailbox batching** (Step 7): Process events from same mailbox for up to `MailboxBatchCycles` before push-back. Amortizes queue overhead, recovering star performance.
 7. **TSAN race fixes**: (a) Write `LastPoolSlotIdx` before `FinishMailbox`/`Unlock`; (b) atomic counters for cross-thread size reads in stress tests.
+8. **Hot continuation (one-shot)**: Two-phase PollSlot with one-shot continuation for fan-in workloads. Phase 1 gives the hot mailbox priority; Phase 2 interleaves queue work. One-shot semantics prevent synchronized contention that caused 4× regression with persistent continuation. Star 8t/10p: 71K (persistent) → 336K (one-shot). See [Hot Continuation](#hot-continuation-one-shot).
 
 
 ## 12. Benchmark Results
