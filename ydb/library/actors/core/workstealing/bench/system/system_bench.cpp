@@ -1402,6 +1402,168 @@ namespace {
     }
 
     // -------------------------------------------------------------------
+    // Mixed-pool benchmark: all 4 workloads on a single pool.
+    //
+    // Answers: does sharing a pool between latency-critical (ping-pong,
+    // chain) and CPU-heavy (storage-node, compaction) workloads cause
+    // the lightweight ones to suffer?
+    //
+    // Compare with multi-pool to quantify the benefit of isolation.
+    // -------------------------------------------------------------------
+
+    void RunMixedPool(const TString& poolType, i16 slots,
+                      ui32 warmupSec, ui32 durationSec) {
+        bool isWs = (poolType == "ws");
+        std::fprintf(stderr, "\n=== Mixed-Pool Benchmark (%s, %d slots) ===\n",
+                     poolType.c_str(), slots);
+
+        auto setup = isWs
+            ? MakeWSSetup(slots, GSpinThresholdCycles)
+            : MakeBasicSetup(slots);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = isWs ? 1 : 0;
+
+        std::atomic<bool> stop{false};
+
+        // Per-workload counters
+        std::atomic<ui64> systemCounter{0};   // chain(10)
+        std::atomic<ui64> userCounter{0};     // storage-node
+        std::atomic<ui64> batchCounter{0};    // chain(5)
+        std::atomic<ui64> icCounter{0};       // ping-pong(8)
+
+        // --- chain(10) ---
+        {
+            ui32 chainLen = 10;
+            std::vector<NActors::TActorId> ids;
+            std::vector<TChainActor*> actors;
+            for (ui32 i = 0; i < chainLen; ++i) {
+                auto* actor = new TChainActor(NActors::TActorId(), systemCounter, stop);
+                actors.push_back(actor);
+                ids.push_back(sys.Register(actor, NActors::TMailboxType::HTSwap, pool));
+            }
+            for (ui32 i = 0; i < chainLen; ++i) {
+                actors[i]->SetNext(ids[(i + 1) % chainLen]);
+            }
+            sys.Send(ids[0], new TEvBenchMsg());
+        }
+
+        // --- storage-node (8 VDisks, 32 clients) ---
+        {
+            TStorageNodeParams sp;
+            sp.VDisks = 8;
+            sp.Clients = 32;
+
+            std::vector<NActors::TActorId> skeletonIds;
+            for (ui32 i = 0; i < sp.VDisks; ++i) {
+                auto* logger = new TLoggerActor(sp.LogWorkIters);
+                auto loggerId = sys.Register(logger, NActors::TMailboxType::HTSwap, pool);
+                auto* compaction = new TCompactionActor(sp.CompactionWorkIters);
+                auto compactionId = sys.Register(compaction, NActors::TMailboxType::HTSwap, pool);
+                auto* skeleton = new TVDiskSkeleton(
+                    loggerId, compactionId, userCounter, stop, sp, pool);
+                auto skeletonId = sys.Register(skeleton, NActors::TMailboxType::HTSwap, pool);
+                skeletonIds.push_back(skeletonId);
+                sys.Send(skeletonId, new TEvCompactionTick());
+            }
+            for (ui32 i = 0; i < sp.Clients; ++i) {
+                auto* client = new TStorageClient(
+                    skeletonIds, userCounter, stop, sp.PutRatio, 42 + i);
+                auto clientId = sys.Register(client, NActors::TMailboxType::HTSwap, pool);
+                sys.Send(clientId, new TEvBenchMsg());
+            }
+        }
+
+        // --- chain(5) ---
+        {
+            ui32 chainLen = 5;
+            std::vector<NActors::TActorId> ids;
+            std::vector<TChainActor*> actors;
+            for (ui32 i = 0; i < chainLen; ++i) {
+                auto* actor = new TChainActor(NActors::TActorId(), batchCounter, stop);
+                actors.push_back(actor);
+                ids.push_back(sys.Register(actor, NActors::TMailboxType::HTSwap, pool));
+            }
+            for (ui32 i = 0; i < chainLen; ++i) {
+                actors[i]->SetNext(ids[(i + 1) % chainLen]);
+            }
+            sys.Send(ids[0], new TEvBenchMsg());
+        }
+
+        // --- ping-pong (8 pairs) ---
+        {
+            ui32 pairCount = 8;
+            for (ui32 i = 0; i < pairCount; ++i) {
+                auto* pong = new TPongActor(icCounter, stop);
+                auto pongId = sys.Register(pong, NActors::TMailboxType::HTSwap, pool);
+                auto* ping = new TPingActor(pongId, icCounter, stop);
+                auto pingId = sys.Register(ping, NActors::TMailboxType::HTSwap, pool);
+                pong->SetPeer(pingId);
+                sys.Send(pingId, new TEvBenchPing());
+            }
+        }
+
+        // Warmup
+        std::fprintf(stderr, "Warming up %u seconds...\n", warmupSec);
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        systemCounter.store(0, std::memory_order_relaxed);
+        userCounter.store(0, std::memory_order_relaxed);
+        batchCounter.store(0, std::memory_order_relaxed);
+        icCounter.store(0, std::memory_order_relaxed);
+        if (isWs) {
+            ResetWsCounters();
+        }
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double cpuSeconds = cpuAfter - cpuBefore;
+
+        struct WorkloadResult {
+            const char* name;
+            const char* workload;
+            std::atomic<ui64>& counter;
+        };
+        WorkloadResult workloads[] = {
+            {"System", "chain(10)", systemCounter},
+            {"User", "storage-node", userCounter},
+            {"Batch", "chain(5)", batchCounter},
+            {"IC", "ping-pong(8)", icCounter},
+        };
+
+        std::printf("pool_type,scenario,workload_name,workload,slots,ops_per_sec,cpu_seconds\n");
+        for (auto& w : workloads) {
+            ui64 ops = w.counter.load(std::memory_order_relaxed);
+            double opsPerSec = (elapsed > 0) ? (double)ops / elapsed : 0;
+            std::printf("%s,mixed-pool,%s,%s,%d,%.0f,%.2f\n",
+                        poolType.c_str(), w.name, w.workload, slots,
+                        opsPerSec, cpuSeconds);
+        }
+        std::fflush(stdout);
+
+        if (isWs) {
+            char label[128];
+            std::snprintf(label, sizeof(label), "%s/mixed-pool t=%d", poolType.c_str(), slots);
+            DumpWsCounters(label);
+        }
+
+        std::fprintf(stderr, "CPU-seconds: %.2f  utilization: %.1f%%\n",
+                     cpuSeconds,
+                     (elapsed > 0 && slots > 0)
+                         ? (cpuSeconds / (elapsed * slots) * 100.0) : 0.0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sys.Stop();
+    }
+
+    // -------------------------------------------------------------------
     // CPU topology info (shared by topology-proof and multi-pool-topology)
     // -------------------------------------------------------------------
 
@@ -1855,7 +2017,7 @@ int main(int argc, const char* argv[]) {
 
     TString scenario = "all";
     opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, "
-        "storage-node, topology-proof, multi-pool, multi-pool-topology, or all")
+        "storage-node, topology-proof, multi-pool, multi-pool-topology, mixed-pool, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -2030,6 +2192,15 @@ int main(int argc, const char* argv[]) {
 
     if (scenario == "multi-pool-topology") {
         RunMultiPoolTopology(multiPoolParams, warmupSec + durationSec);
+        return 0;
+    }
+
+    if (scenario == "mixed-pool") {
+        i16 totalSlots = multiPoolParams.SystemSlots + multiPoolParams.UserSlots
+                       + multiPoolParams.BatchSlots + multiPoolParams.ICSlots;
+        for (const auto& pt : poolTypes) {
+            RunMixedPool(pt, totalSlots, warmupSec, durationSec);
+        }
         return 0;
     }
 
