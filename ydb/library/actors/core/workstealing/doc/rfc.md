@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented (Steps 0-16 complete, plus post-v1 optimizations including hot continuation). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-2.8× faster on ping-pong, 1.4-1.9× on star, 1.2-2.6× on chain for the best configurations. See Section 11 for full results.
+Implemented (Steps 0-16 complete, plus post-v1 optimizations including continuation ring). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-4.5× faster on ping-pong, 1.2-1.8× on star, 1.2-2.4× on chain, 1.3-5.9× on pipeline for the best configurations. See Section 12 for full results.
 
 ## 1. Problem Statement
 
@@ -87,32 +87,27 @@ stateDiagram-v2
 
 ### Polling Routine
 
-The core loop executed by each worker for each assigned slot. Uses a **two-phase execution model** with **one-shot hot continuation** and **time-based batching**.
+The core loop executed by each worker for each assigned slot. Uses a **continuation ring** with **time-based batching** for execution, and **topology-aware work stealing** when idle.
 
-- **Phase 1 (one-shot):** If a hot continuation was saved from the previous PollSlot call, process it first with a fresh `MaxExecBatch` budget. The continuation gets a priority run but is NOT saved back — if it can't drain within the budget, it's pushed to the queue for fair interleaving. This gives hot mailboxes priority without monopolization. See [Hot Continuation](#hot-continuation-one-shot) for the full motivation.
+- **Seeding:** If the continuation ring has items from a previous PollSlot (mailboxes that exhausted the event budget), pop one to seed the loop. This gives hot mailboxes first-execution priority. When the ring is empty, this is a no-op — zero overhead on the common path.
 
-- **Phase 2 (queue):** Pop activations from the MPMC queue and execute with a separate `MaxExecBatch` budget. Each mailbox runs for up to `MailboxBatchCycles` (~17μs at 3GHz). When the time slice expires, check the queue inline: if other work is waiting, swap activations (push current, pop next); if empty, reset the deadline and continue the same mailbox. If Phase 2 exhausts its budget while a mailbox still has events, that mailbox is saved as the hot continuation for the next PollSlot call.
+- **Queue processing:** Pop activations from the MPMC queue and execute with a `MaxExecBatch` event budget. Each mailbox runs for up to `MailboxBatchCycles` (~17μs at 3GHz). When the time slice expires, check the queue inline: if other work is waiting, push current to queue tail and pop next (inline swap); if empty, reset the deadline and continue the same mailbox. If the budget is exhausted while a mailbox still has events, that mailbox is saved to the continuation ring for the next PollSlot call.
 
-- **Stealing:** If both phases found no work, try stealing from neighbor slots with exponential backoff. Stolen items are executed directly from a stack buffer (no reinjection into the queue).
+- **Stealing:** If no work found, try stealing from neighbor slots with exponential backoff. Stolen items are executed directly from a stack buffer (no reinjection into the queue).
 
 ```mermaid
 flowchart TD
-    START([PollSlot]) --> CONT{Hot<br/>continuation?}
+    START([PollSlot]) --> SEED{Ring<br/>has items?}
 
-    CONT -->|yes| P1["<b>Phase 1 (one-shot)</b><br/>Execute with own<br/>MaxExecBatch budget"]
-    P1 --> P1DONE{Mailbox<br/>drained?}
-    P1DONE -->|no| P1PUSH["Push to queue tail<br/><i>(not saved as continuation)</i>"]
-    P1DONE -->|yes| P2START
-    P1PUSH --> P2START
-
-    CONT -->|no| P2START
-    P2START["<b>Phase 2</b><br/>Fresh MaxExecBatch budget"] --> POP
+    SEED -->|yes| RPOP["Pop one from ring<br/><i>(priority seeding)</i>"]
+    RPOP --> EXEC
+    SEED -->|no| POP
 
     POP{Pop from<br/>queue?} -->|activation| EXEC["Execute events for<br/>up to MailboxBatchCycles"]
     EXEC --> DRAIN{Mailbox<br/>drained?}
     DRAIN -->|yes| BUDGET
     DRAIN -->|no, deadline hit| PEEK{Queue has<br/>other work?}
-    PEEK -->|yes| SWAP["Push current,<br/>pop next"]
+    PEEK -->|yes| SWAP["Push current to queue,<br/>pop next"]
     PEEK -->|no| RESET["Reset deadline,<br/>continue same mailbox"]
     SWAP --> EXEC
     RESET --> EXEC
@@ -121,7 +116,7 @@ flowchart TD
     DRAIN -->|no, budget exhausted| SAVE
     BUDGET -->|no, activation live| SAVE
 
-    SAVE["Save as<br/>HotContinuation"] --> BUSY(["Return Busy"])
+    SAVE["Save to<br/>continuation ring"] --> BUSY(["Return Busy"])
     BUDGET -->|no, drained| BUSY
 
     POP -->|empty| STEAL{Steal from<br/>neighbors?}
@@ -131,13 +126,14 @@ flowchart TD
 ```
 
 **Key details:**
-- **Two-phase budgets:** Phase 1 and Phase 2 each get `MaxExecBatch` (default 64) events. The hot continuation gets priority without starving queue activations, and total work per PollSlot is bounded at 2 × `MaxExecBatch`.
-- **Inline interleaving:** Phase 2 checks the queue when a mailbox's time slice expires. If another activation is waiting, it swaps without leaving the inner loop. If empty, the deadline resets and the same mailbox continues — avoiding unnecessary MPMC push/pop overhead and false steal potential.
+- **Continuation ring seeding:** The ring holds activations that exhausted the entire event budget — proven hottest. One item is popped per PollSlot for priority execution. When the ring is empty, seeding falls through to `slot.Pop()` — identical to the pre-ring code path.
+- **Inline interleaving:** When a mailbox's time slice expires, the loop checks the queue inline. If another activation is waiting, it pushes the current activation to queue tail and pops the next — swapping without leaving the inner loop. Only budget-exhaustion leftovers go to the ring (not time swaps), ensuring the ring holds only the hottest actors. If the queue is empty, the deadline resets and the same mailbox continues — avoiding unnecessary MPMC push/pop overhead and false steal potential.
 - **Direct steal execution:** Stolen items are executed directly from a stack buffer on the stealer's stack. Only items that still have events after execution are pushed to the local queue. This avoids re-steal races.
 - `HadLocalWork` flag distinguishes local work from stolen work, used by the Worker loop for parking decisions.
 - Before probing a victim, the stealer checks `SizeEstimate() == 0` and `Executing == false` and skips empty/idle slots.
+- The ring's `ContinuationCount` is exported to the activation router, which includes it in load estimates for routing decisions. This prevents the router from overloading slots whose MPMC queue looks empty but whose ring is occupied.
 
-### Hot Continuation (One-Shot)
+### Continuation Ring
 
 #### Problem: Fan-In Budget Exhaustion
 
@@ -173,48 +169,43 @@ Each `Push` is a `fetch_add` on the MPMC queue's tail counter. Under 8-way conte
 
 Diagnostic counters confirmed this: `Phase1Deadlines ≈ BusyPolls` (virtually every Phase 1 hit the time deadline), and `Phase1Execs / BusyPolls ≈ 8` (only 8 events per Phase 1, not 64).
 
-#### Solution: One-Shot Continuation
+#### Attempt 2: One-Shot Continuation
 
 Phase 1 consumes the continuation but does **not** save it back. If the mailbox still has events after Phase 1's budget, it's pushed to the queue — where Phase 2 and other activations interleave fairly. Only Phase 2's leftover (if any) becomes the next continuation.
 
+This breaks the synchronization: Phase 1 is brief, workers desynchronize in Phase 2, and the continuation mechanism only engages when there's actual sustained load. One-shot eliminated the 8t regression while preserving the fan-in improvement.
+
+#### Solution: Continuation Ring with Queue-Only Swaps
+
+The one-shot approach used a single `std::optional<ui32> HotContinuation`. The continuation ring replaces it with a `TContinuationRing` (stack-allocated FIFO, capacity 4, configurable up to 8) that can hold multiple hot activations across PollSlot calls.
+
+**Key design principle:** Only budget-exhaustion leftovers enter the ring. Time-based inline swaps push to the queue, not the ring. This ensures the ring holds only the proven hottest actors — those that consumed the entire `MaxExecBatch` budget.
+
 ```
 PollSlot call N:
-  Phase 1: Execute continuation (sender_k), push back to queue
-  Phase 2: Pop sender_k, sender_j, receiver, ... (interleaved)
-           Last activation exhausts budget → saved as continuation
+  Seed: Pop from ring → activation A (priority execution)
+  Queue loop: Pop B, execute, time swap → push B to queue, pop C
+              Continue until budget exhausted on activation D
+  Save: Push D to ring (proven hottest)
 
 PollSlot call N+1:
-  Phase 1: Execute that continuation (one-shot, not saved back)
-  Phase 2: ...
+  Seed: Pop from ring → activation D (or A if D drained)
+  Queue loop: ...
 ```
 
-This breaks the synchronization because:
-1. **Phase 1 is brief** — one budget of the saved continuation, then it's done.
-2. **Workers desynchronize in Phase 2** — they enter Phase 2 at different times, process different queue depths, and generate receiver events at staggered intervals rather than simultaneously.
-3. **Self-balancing** — when the hot mailbox drains completely, no continuation is saved. The next PollSlot starts directly with Phase 2. The continuation mechanism only engages when there's actual sustained load.
+**Why queue-only swaps?** Promoting time-swap items to the ring dilutes it with less-hot actors. In star workloads, this fills the ring with senders that survive one time slice, pushing out the truly hot hub actor. Queue-only swaps keep the ring reserved for budget-exhaustion survivors — the actors that consistently consume the most events per PollSlot.
+
+**Ring occupancy for routing:** Each slot exports `ContinuationCount` (ring size) as a relaxed atomic. The activation router includes this in load estimates, preventing the router from overloading slots whose MPMC queue looks empty but whose ring is occupied.
 
 #### Flush Invariants
 
-A locked mailbox must never be abandoned in `HotContinuation`. The worker must flush it (push to queue) before:
+A locked mailbox must never be abandoned in the continuation ring. The worker must flush the ring (push all items to queue) before:
 
-1. **Draining** (slot transitioning to `Inactive`): push before Dekker `WorkerSpinning=false` so `HasWork()` sees it
-2. **Parking** (spin timeout): push before Dekker protocol
-3. **Shutdown** (worker loop exit): push before teardown
+1. **Draining** (slot transitioning to `Inactive`): flush before Dekker `WorkerSpinning=false` so `HasWork()` sees it
+2. **Parking** (spin timeout): flush before Dekker protocol
+3. **Shutdown** (worker loop exit): flush before teardown
 
 See `thread_driver.cpp:WorkerLoop()` for the three flush points.
-
-#### Benchmark Results
-
-| Config | Basic | WS (persistent) | WS (one-shot) |
-|--------|-------|-----------------|---------------|
-| Star 4t/10p | 157K | 228K (+45%) | 228K (+45%) |
-| Star 4t/100p | 14.9K | — | 25.9K (+74%) |
-| Star 8t/10p | 319K | **71K (−78%)** | 336K (+5%) |
-| Star 8t/100p | 27.7K | — | 42.0K (+52%) |
-| Ping-pong 4t/10p | 762K | — | 1.04M (+37%) |
-| Ping-pong 8t/10p | 1.44M | — | 2.07M (+44%) |
-
-One-shot eliminates the 8t regression while preserving the fan-in improvement at all thread counts.
 
 ### Activation Routing
 
@@ -406,6 +397,7 @@ struct TWsConfig {
     uint16_t MaxSlots = 128;               // max slots per pool
     uint32_t EventsPerMailbox = 100;       // max events per mailbox execution
     uint64_t TimePerMailboxNs = 1000000;   // 1ms -- max time per mailbox execution
+    uint8_t ContinuationRingCapacity = 4;  // max items in continuation ring (1-8)
     uint32_t ParkAfterIdlePolls = 64;      // (unused, kept for future use)
 };
 ```
@@ -478,7 +470,7 @@ Storage Performance Development Kit uses pollers (non-blocking poll functions) a
 
 ## 11. Implementation Summary
 
-All 17 steps are complete. 136 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
+All 17 steps are complete. 144 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
 
 ```
 Step 0  Contention Analysis           ✓
@@ -510,7 +502,7 @@ Step 16 System-level A/B Benchmarks   ✓ (ping-pong, star, chain; CSV + CPU uti
 5. **Single-event execution with push-back** (Step 7/16): Replaced batch-then-reinject model with single-event callback + push-back. Prevents self-send starvation.
 6. **Time-based mailbox batching** (Step 7): Process events from same mailbox for up to `MailboxBatchCycles` before push-back. Amortizes queue overhead, recovering star performance.
 7. **TSAN race fixes**: (a) Write `LastPoolSlotIdx` before `FinishMailbox`/`Unlock`; (b) atomic counters for cross-thread size reads in stress tests.
-8. **Hot continuation (one-shot)**: Two-phase PollSlot with one-shot continuation for fan-in workloads. Phase 1 gives the hot mailbox priority; Phase 2 interleaves queue work. One-shot semantics prevent synchronized contention that caused 4× regression with persistent continuation. Star 8t/10p: 71K (persistent) → 336K (one-shot). See [Hot Continuation](#hot-continuation-one-shot).
+8. **Continuation ring**: Replaced single `HotContinuation` with `TContinuationRing` (FIFO, capacity 4). Budget-exhaustion leftovers saved to ring; time-swap items go to queue only. Ring occupancy exported via `ContinuationCount` for load-aware routing. See [Continuation Ring](#continuation-ring).
 
 
 ## 12. Benchmark Results
@@ -526,84 +518,108 @@ see [benchmarks.md](benchmarks.md).
 
 | Threads | Pairs | Basic ops/s | WS ops/s | Ratio | WS CPU% |
 |---------|-------|------------|---------|-------|---------|
-| 1 | 10 | 360K | 462K | **1.28×** | 101 |
-| 1 | 100 | 363K | 463K | **1.28×** | 101 |
-| 1 | 1000 | 359K | 461K | **1.28×** | 101 |
-| 16 | 10 | 2,822K | 3,945K | **1.40×** | 81 |
-| 16 | 100 | 3,060K | 5,551K | **1.81×** | 100 |
-| 16 | 1000 | 3,315K | 5,580K | **1.68×** | 100 |
-| 96 | 10 | 1,200K | 3,316K | **2.76×** | 17 |
-| 96 | 100 | 11,367K | 12,609K | **1.11×** | 96 |
-| 96 | 1000 | 10,806K | 15,148K | **1.40×** | 100 |
-| 192 | 10 | 1,345K | 3,644K | **2.71×** | 11 |
-| 192 | 100 | 9,002K | 12,524K | **1.39×** | 68 |
-| 192 | 1000 | 11,889K | 19,873K | **1.67×** | 99 |
-| 384 | 10 | 746K | 3,794K | **5.09×** | 5 |
-| 384 | 100 | 6,007K | 10,316K | **1.72×** | 41 |
-| 384 | 1000 | 15,081K | 22,111K | **1.47×** | 98 |
+| 1 | 10 | 319K | 289K | 0.91× | 95 |
+| 1 | 100 | 324K | 347K | **1.07×** | 100 |
+| 1 | 1000 | 325K | 374K | **1.15×** | 100 |
+| 16 | 10 | 2,754K | 4,838K | **1.76×** | 98 |
+| 16 | 100 | 2,978K | 5,106K | **1.71×** | 100 |
+| 16 | 1000 | 3,278K | 5,126K | **1.56×** | 100 |
+| 96 | 10 | 1,254K | 4,113K | **3.28×** | 17 |
+| 96 | 100 | 11,786K | 12,092K | **1.03×** | 99 |
+| 96 | 1000 | 11,190K | 15,533K | **1.39×** | 102 |
+| 192 | 10 | 1,073K | 4,034K | **3.76×** | 9 |
+| 192 | 100 | 8,631K | 12,598K | **1.46×** | 67 |
+| 192 | 1000 | 11,878K | 19,494K | **1.64×** | 99 |
+| 384 | 10 | 736K | 3,279K | **4.45×** | 6 |
+| 384 | 100 | 998K | 10,507K | **10.53×** | 38 |
+| 384 | 1000 | 15,037K | 21,843K | **1.45×** | 100 |
 
 ### Star (fan-in: N senders → 1 receiver)
 
-| Threads | Senders | Basic ops/s | WS ops/s | Ratio |
-|---------|---------|------------|---------|-------|
-| 1 | 10 | 40K | 72K | **1.78×** |
-| 1 | 100 | 4.1K | 7.7K | **1.87×** |
-| 1 | 1000 | 440 | 673 | **1.53×** |
-| 16 | 10 | 456K | 639K | **1.40×** |
-| 16 | 100 | 57K | 74K | **1.30×** |
-| 16 | 1000 | 5.5K | 7.7K | **1.40×** |
-| 96 | 10 | 479K | 548K | **1.14×** |
-| 96 | 100 | 43K | 25K | 0.58× |
-| 96 | 1000 | 3.2K | 4.1K | **1.27×** |
-| 192 | 10 | 380K | 658K | **1.73×** |
-| 192 | 100 | 76K | 47K | 0.62× |
-| 192 | 1000 | 5.0K | 818 | 0.16× |
-| 384 | 10 | 351K | 652K | **1.86×** |
-| 384 | 100 | 44K | 28K | 0.63× |
-| 384 | 1000 | 820 | 567 | 0.69× |
+| Threads | Senders | Basic ops/s | WS ops/s | Ratio | WS CPU% |
+|---------|---------|------------|---------|-------|---------|
+| 1 | 10 | 40K | 73K | **1.80×** | 101 |
+| 1 | 100 | 4.2K | 7.8K | **1.84×** | 100 |
+| 1 | 1000 | 420 | 452 | **1.08×** | 101 |
+| 16 | 10 | 383K | 582K | **1.52×** | 68 |
+| 16 | 100 | 53K | 89K | **1.66×** | 100 |
+| 16 | 1000 | 5.6K | 9.5K | **1.70×** | 100 |
+| 96 | 10 | 476K | 582K | **1.22×** | 11 |
+| 96 | 100 | 46K | 45K | 0.99× | 101 |
+| 96 | 1000 | 1.1K | 4.6K | **4.26×** | 99 |
+| 192 | 10 | 413K | 575K | **1.39×** | 6 |
+| 192 | 100 | 71K | 41K | 0.58× | 53 |
+| 192 | 1000 | 3.8K | 1.9K | 0.49× | 99 |
+| 384 | 10 | 379K | 530K | **1.40×** | 3 |
+| 384 | 100 | 71K | 43K | 0.60× | 27 |
+| 384 | 1000 | 980 | 3.1K | **3.18×** | 101 |
 
 ### Chain (sequential ring of N actors)
 
 | Threads | Chain len | Basic ops/s | WS ops/s | Ratio | Basic CPU% | WS CPU% |
 |---------|-----------|------------|---------|-------|-----------|---------|
-| 1 | 10 | 368K | 451K | **1.22×** | 101 | 101 |
-| 1 | 100 | 361K | 465K | **1.29×** | 101 | 101 |
-| 1 | 1000 | 369K | 468K | **1.27×** | 101 | 101 |
-| 16 | 10 | 278K | 684K | **2.46×** | 33 | 57 |
-| 16 | 100 | 252K | 568K | **2.25×** | 33 | 100 |
-| 16 | 1000 | 285K | 584K | **2.05×** | 32 | 100 |
-| 96 | 10 | 241K | 629K | **2.61×** | 5 | 10 |
-| 96 | 100 | 285K | 378K | **1.33×** | 5 | 102 |
-| 96 | 1000 | 242K | 378K | **1.56×** | 6 | 97 |
-| 192 | 10 | 354K | 587K | **1.66×** | 3 | 6 |
-| 192 | 100 | 289K | 372K | **1.29×** | 3 | 50 |
-| 192 | 1000 | 230K | 217K | 0.94× | 3 | 100 |
-| 384 | 10 | 302K | 548K | **1.81×** | 2 | 3 |
-| 384 | 100 | 290K | 392K | **1.35×** | 1 | 26 |
-| 384 | 1000 | 211K | 79K | 0.37× | 2 | 98 |
+| 1 | 10 | 367K | 426K | **1.16×** | 100 | 101 |
+| 1 | 100 | 367K | 428K | **1.17×** | 101 | 101 |
+| 1 | 1000 | 369K | 427K | **1.16×** | 100 | 101 |
+| 16 | 10 | 271K | 630K | **2.32×** | 27 | 59 |
+| 16 | 100 | 271K | 530K | **1.96×** | 32 | 100 |
+| 16 | 1000 | 283K | 537K | **1.90×** | 26 | 100 |
+| 96 | 10 | 298K | 477K | **1.60×** | 5 | 11 |
+| 96 | 100 | 204K | 332K | **1.63×** | 6 | 100 |
+| 96 | 1000 | 259K | 312K | **1.20×** | 6 | 101 |
+| 192 | 10 | 212K | 516K | **2.44×** | 3 | 5 |
+| 192 | 100 | 207K | 310K | **1.50×** | 3 | 52 |
+| 192 | 1000 | 287K | 192K | 0.67× | 3 | 99 |
+| 384 | 10 | 283K | 434K | **1.53×** | 1 | 3 |
+| 384 | 100 | 215K | 346K | **1.61×** | 1 | 26 |
+| 384 | 1000 | 251K | 141K | 0.56× | 2 | 100 |
+
+### Pipeline (5-stage pipeline, N parallel pipelines)
+
+| Threads | Pipelines | Basic ops/s | WS ops/s | Ratio | WS CPU% |
+|---------|-----------|------------|---------|-------|---------|
+| 1 | 10 | 82K | 79K | 0.97× | 100 |
+| 1 | 100 | 81K | 79K | 0.97× | 100 |
+| 1 | 1000 | 30K | 76K | **2.55×** | 100 |
+| 16 | 10 | 1,109K | 523K | 0.47× | 100 |
+| 16 | 100 | 1,037K | 968K | 0.93× | 100 |
+| 16 | 1000 | 1,049K | 1,002K | 0.96× | 100 |
+| 96 | 10 | 2,073K | 2,702K | **1.30×** | 64 |
+| 96 | 100 | 4,750K | 2,642K | 0.56× | 100 |
+| 96 | 1000 | 4,686K | 3,517K | 0.75× | 101 |
+| 192 | 10 | 457K | 2,677K | **5.86×** | 33 |
+| 192 | 100 | 6,982K | 2,590K | 0.37× | 93 |
+| 192 | 1000 | 6,780K | 4,064K | 0.60× | 99 |
+| 384 | 10 | 681K | 2,096K | **3.08×** | 17 |
+| 384 | 100 | 10,322K | 2,592K | 0.25× | 93 |
+| 384 | 1000 | 10,174K | 3,327K | 0.33× | 100 |
 
 ### Analysis
 
-**Ping-pong:** WS wins across all configurations. Best results at high thread counts with low pair counts, where the basic pool's MPMC contention is worst: **5.09× at 384t/10p** (WS uses only 5% CPU vs basic's 96%). At the highest throughput point (384t/1000p), WS delivers 22.1M ops/s vs 15.1M — **1.47× with equal CPU usage**.
+**Ping-pong:** WS wins across nearly all configurations. Best at overprovisioned thread counts: **10.53× at 384t/100p** (WS uses 38% CPU vs basic's 60%). At the highest throughput point (384t/1000p), WS delivers 21.8M ops/s vs 15.0M — **1.45× with equal CPU usage**. Minor regression at 1t/10p (0.91×) from rdtsc overhead in the batch loop.
 
-**Star:** WS wins at low-to-mid pair counts (1.1-1.9×) thanks to time-based batching which amortizes queue overhead for the hot receiver mailbox. Regression persists at high pair counts with many threads (96t/100p: 0.58×, 192t/1000p: 0.16×). This is a fundamental contention bottleneck — 1000 senders contending for 1 receiver mailbox lock, with WS workers spending cycles on push-back while basic processes events in batch.
+**Star:** WS wins at low-to-mid pair counts (1.2-1.8×) thanks to time-based batching and the continuation ring giving the hot receiver mailbox priority seeding. Strong improvements at 96t/1000p (**4.26×**) and 384t/1000p (**3.18×**) where basic's shared MPMC queue saturates. Regression at 192t/100p (0.58×) and 384t/100p (0.60×) from per-slot queue overhead with many senders per slot.
 
-**Chain:** WS wins strongly at low-to-mid pair counts (1.2-2.6×). Chain is inherently sequential — only one actor is active at a time. WS excels because the sticky slot keeps the active chain link local, avoiding MPMC contention. Regression at 384t/1000p (0.37×): WS workers spin at 98% CPU waiting for work that rarely arrives, while basic's idle threads use only 2%.
+**Chain:** WS wins across most configurations (1.2-2.4×). Chain is inherently sequential — only one actor is active at a time. WS excels because sticky routing keeps the active chain link local, avoiding MPMC contention. Regression at 192t/1000p (0.67×) and 384t/1000p (0.56×): with many chains, WS workers spin on occupied queues at 100% CPU while basic's idle threads use only 2-3%.
+
+**Pipeline:** Mixed results reflecting a fundamental trade-off. WS excels when threads >> active actors: **5.86× at 192t/10p** (WS uses 33% CPU vs basic's 100%), **3.08× at 384t/10p**. But basic wins at high pipeline counts (384t/100p: 0.25×, 384t/1000p: 0.33×) where its shared MPMC queue amortizes contention across many independent pipeline stages. At 1t/1000p WS wins **2.55×** thanks to continuation ring keeping hot pipeline stages out of the queue.
 
 ### CPU Efficiency
 
 A key WS advantage: at overprovisioned thread counts (threads >> active actors), WS parks idle workers and uses dramatically less CPU. Examples:
-- PP 384t/10p: WS **5% CPU** vs basic 96%, while delivering **5× throughput**
-- Star 192t/10p: WS **6% CPU** vs basic 8%, at **1.73× throughput**
-- Chain 96t/10p: WS **10% CPU** vs basic 5%, at **2.61× throughput**
+- PP 384t/100p: WS **38% CPU** vs basic 60%, while delivering **10.5× throughput**
+- Pipeline 192t/10p: WS **33% CPU** vs basic 100%, at **5.9× throughput**
+- Star 384t/10p: WS **3% CPU** vs basic 12%, at **1.4× throughput**
+- Chain 192t/10p: WS **5% CPU** vs basic 3%, at **2.4× throughput**
 
 ### Known Regressions and Root Causes
 
 | Pattern | Worst case | Root cause | Potential fix |
 |---------|-----------|------------|---------------|
-| Star, high pairs, many threads | 192t/1000p: 0.16× | Receiver mailbox lock contention; push-back overhead per batch | Adaptive batch size based on mailbox event rate |
-| Chain, many threads, high pairs | 384t/1000p: 0.37× | Workers spin on empty queues; park mechanism too slow to converge | Faster park convergence; park after N empty steals |
-| Ping-pong, single-thread | 1t: 1.28× (was 1.41×) | rdtsc overhead per event in batch loop | Check deadline every Nth event |
+| Pipeline, high pairs, many threads | 384t/100p: 0.25× | Per-slot queue overhead vs basic's shared MPMC amortization across stages | Pipeline-aware routing; batch execution across pipeline stages |
+| Star, mid pairs, many threads | 192t/100p: 0.58× | Per-slot push-back overhead with many senders per slot | Adaptive batch size based on mailbox event rate |
+| Chain, many threads, high pairs | 384t/1000p: 0.56× | Workers spin on occupied queues; park mechanism too slow to converge | Faster park convergence; park after N empty steals |
+| Ping-pong, single-thread | 1t/10p: 0.91× | rdtsc overhead per event in batch loop | Check deadline every Nth event |
 
 
 ## References

@@ -247,6 +247,7 @@ namespace NActors::NWorkStealing {
 
         auto stealIterator = MakeStealIterator(worker.Slot);
         TPollState pollState;
+        pollState.Ring.Capacity = Config_.ContinuationRingCapacity;
         ui64 lastLocalWorkTs = GetCycleCountFast();
         // Adaptive spin: start with short threshold after wake, extend to full
         // threshold once the slot proves it has steady local work.
@@ -259,18 +260,18 @@ namespace NActors::NWorkStealing {
 
             if (slotState == ESlotState::Draining) {
                 // Drain remaining activations without stealing — slot is winding down.
-                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, Config_, pollState);
+                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState);
                 if (result == EPollResult::Busy) {
                     lastLocalWorkTs = GetCycleCountFast();
                     continue;
                 }
 
-                // Flush hot continuation before Dekker check — the mailbox
+                // Flush ring before Dekker check — locked mailboxes
                 // must be visible in the queue before we announce not-spinning.
-                if (pollState.HotContinuation) {
-                    worker.Slot->Push(*pollState.HotContinuation);
-                    pollState.HotContinuation.reset();
-                    continue;  // re-enter loop to process it
+                if (!pollState.Ring.Empty()) {
+                    pollState.Ring.FlushTo(*worker.Slot);
+                    worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
+                    continue;  // re-enter loop to process flushed items
                 }
 
                 // Queue appears empty. Dekker: announce not-spinning, re-check
@@ -317,7 +318,7 @@ namespace NActors::NWorkStealing {
                 continue;
             }
 
-            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, Config_, pollState);
+            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState);
 
             if (pollState.HadLocalWork) {
                 lastLocalWorkTs = GetCycleCountFast();
@@ -337,11 +338,11 @@ namespace NActors::NWorkStealing {
             {
                 ui64 now = GetCycleCountFast();
                 if (now - lastLocalWorkTs > spinThreshold) {
-                    // Flush hot continuation before parking — push it to the
-                    // queue so it's visible to WakeSlot's HasWork() check.
-                    if (pollState.HotContinuation) {
-                        worker.Slot->Push(*pollState.HotContinuation);
-                        pollState.HotContinuation.reset();
+                    // Flush ring before parking — push locked mailboxes to the
+                    // queue so they're visible to WakeSlot's HasWork() check.
+                    if (!pollState.Ring.Empty()) {
+                        pollState.Ring.FlushTo(*worker.Slot);
+                        worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
                     }
 
                     // Dekker protocol: announce intent to park, then re-check.
@@ -371,10 +372,10 @@ namespace NActors::NWorkStealing {
             }
         }
 
-        // Flush any remaining hot continuation before shutdown.
-        if (pollState.HotContinuation) {
-            worker.Slot->Push(*pollState.HotContinuation);
-            pollState.HotContinuation.reset();
+        // Flush any remaining ring items before shutdown.
+        if (!pollState.Ring.Empty()) {
+            pollState.Ring.FlushTo(*worker.Slot);
+            worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
         }
 
         worker.Slot->WorkerSpinning.store(false, std::memory_order_release);

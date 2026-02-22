@@ -22,7 +22,8 @@ namespace NActors::NWorkStealing {
         if (lastSlotIdx > 0 && lastSlotIdx <= activeCount) {
             size_t idx = lastSlotIdx - 1;
             if (Slots_[idx].GetState() == ESlotState::Active) {
-                size_t stickyLoad = Slots_[idx].SizeEstimate();
+                size_t stickyLoad = Slots_[idx].SizeEstimate()
+                                  + Slots_[idx].ContinuationCount.load(std::memory_order_relaxed);
                 if (stickyLoad <= 1) {
                     // Slot is empty or near-empty — always use it.
                     Slots_[idx].Push(hint);
@@ -30,7 +31,8 @@ namespace NActors::NWorkStealing {
                 }
                 // Compare with a hash-derived peer.
                 size_t peer = (hint ^ 0x9e3779b9u) % activeCount;
-                size_t peerLoad = Slots_[peer].SizeEstimate();
+                size_t peerLoad = Slots_[peer].SizeEstimate()
+                                + Slots_[peer].ContinuationCount.load(std::memory_order_relaxed);
                 if (stickyLoad <= peerLoad * 2 + 2) {
                     Slots_[idx].Push(hint);
                     return static_cast<int>(idx);
@@ -73,9 +75,11 @@ namespace NActors::NWorkStealing {
             idxB = (idxA + 1) % activeCount;
         }
 
-        size_t first = (Slots_[idxA].SizeEstimate() <= Slots_[idxB].SizeEstimate())
-                            ? idxA
-                            : idxB;
+        size_t loadA = Slots_[idxA].SizeEstimate()
+                     + Slots_[idxA].ContinuationCount.load(std::memory_order_relaxed);
+        size_t loadB = Slots_[idxB].SizeEstimate()
+                     + Slots_[idxB].ContinuationCount.load(std::memory_order_relaxed);
+        size_t first = (loadA <= loadB) ? idxA : idxB;
         size_t second = (first == idxA) ? idxB : idxA;
 
         if (Slots_[first].GetState() == ESlotState::Active) {

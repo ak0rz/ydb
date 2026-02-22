@@ -12,6 +12,7 @@ namespace NActors::NWorkStealing {
     // Callbacks provided by the pool per worker slot.
     struct TWorkerCallbacks {
         TExecuteCallback Execute;       // Called per activation (ui32 hint -> bool preempted)
+        TOverflowCallback Overflow;     // Ring overflow → reroute activation to another slot
         std::function<void()> Setup;    // Called once at worker thread start (TLS setup)
         std::function<void()> Teardown; // Called once at worker thread end (TLS cleanup)
     };

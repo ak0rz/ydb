@@ -17,6 +17,7 @@ namespace NActors::NWorkStealing {
         uint32_t EventsPerMailbox = 100;      // max events per mailbox execution
         uint64_t TimePerMailboxNs = 1000000;  // 1ms -- max time per mailbox execution
         uint32_t ParkAfterIdlePolls = 64;     // park after this many consecutive idle PollSlot calls
+        uint8_t ContinuationRingCapacity = 4;  // max items in continuation ring (1-8)
     };
 
 } // namespace NActors::NWorkStealing

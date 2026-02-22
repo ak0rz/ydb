@@ -75,6 +75,7 @@ namespace NActors::NWorkStealing {
 
         std::atomic<bool> WorkerSpinning{false};
         std::atomic<bool> Executing{false};   // true while inside executeCallback
+        std::atomic<uint8_t> ContinuationCount{0};  // ring occupancy, read by router
         void* DriverData = nullptr;
         NActors::TMailboxTable* MailboxTable = nullptr;  // set by pool init, used for cost-aware stealing
 

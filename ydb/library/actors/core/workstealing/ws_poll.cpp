@@ -48,67 +48,31 @@ namespace NActors::NWorkStealing {
         TSlot& slot,
         IStealIterator* stealIterator,
         const TExecuteCallback& executeCallback,
+        const TOverflowCallback& overflowCallback,
         const TWsConfig& config,
         TPollState& pollState)
     {
+        Y_UNUSED(overflowCallback);  // reserved for future active load-shedding
+
         bool didWork = false;
 
-        // Phase 1: One-shot hot continuation.
+        // Queue processing with continuation ring seeding.
         //
-        // If the previous PollSlot saved a hot continuation (a mailbox that
-        // exhausted Phase 2's event budget while still having work), process
-        // it first with a fresh MaxExecBatch budget.
-        //
-        // ONE-SHOT: The continuation is consumed here and NOT saved back.
-        // If it still has events after this budget, it's pushed to the
-        // queue tail for fair interleaving in Phase 2. Only Phase 2's
-        // leftover can become the next continuation.
-        //
-        // Why not persistent? Saving it back after Phase 1 synchronizes
-        // all workers: every PollSlot call starts with the same hot sender,
-        // causing N threads to CAS-push events to the same receiver queue
-        // simultaneously. Under 8-way contention, per-event cost inflates
-        // from ~700 to ~6000 cycles (cache-line bouncing), hitting the
-        // MailboxBatchCycles deadline after ~8 events instead of 64.
-        // One-shot breaks this synchronization: workers desynchronize in
-        // Phase 2, processing different queue depths at different times.
-        std::optional<ui32> activation = std::exchange(pollState.HotContinuation, std::nullopt);
-        if (activation) {
-            size_t contBudget = config.MaxExecBatch;
-
-            slot.Executing.store(true, std::memory_order_release);
-            NHPTimer::STime hpnow = GetCycleCountFast();
-            NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
-
-            bool hasMore = ExecuteBatch(
-                executeCallback, *activation, deadline,
-                contBudget, didWork, slot.Counters, hpnow);
-
-            slot.Executing.store(false, std::memory_order_release);
-
-            if (hasMore) {
-                slot.Push(*activation);
-            }
-            activation.reset();
-        }
-
-        // Phase 2: Queue processing with inline interleaving.
-        //
-        // Pop activations from the MPMC queue and execute with a fresh
-        // MaxExecBatch budget (independent of Phase 1's budget, so total
-        // work per PollSlot is bounded at 2 × MaxExecBatch).
+        // The ring holds activations that exhausted the entire event budget
+        // on a previous PollSlot — proven hottest. One ring item is popped
+        // to seed the loop, giving it first-execution priority. Remaining
+        // ring items are consumed in subsequent PollSlots.
         //
         // Each mailbox runs for up to MailboxBatchCycles. When the time
         // deadline expires, we check the queue inline:
-        //   - Other work waiting: push current activation, pop next (swap).
-        //     Interleaves activations fairly without leaving the inner loop.
+        //   - Other work waiting: push current to queue tail, pop next.
+        //     Only budget-exhaustion leftovers go to ring (not time swaps).
         //   - Queue empty: reset deadline, continue same mailbox. Avoids
-        //     unnecessary push/pop overhead and false steal potential
-        //     (items briefly visible in queue during push-pop round-trip).
+        //     unnecessary overhead and false steal potential.
         //
-        // If execBudget is exhausted while a mailbox still has events,
-        // that mailbox exits the loop and is saved as HotContinuation
-        // for the next PollSlot call.
+        // When ring is empty: seed falls through to slot.Pop() — identical
+        // to the pre-ring code path. Zero overhead.
+        std::optional<ui32> activation = pollState.Ring.Pop();
         size_t execBudget = config.MaxExecBatch;
         while (execBudget > 0) {
             if (!activation) {
@@ -138,6 +102,9 @@ namespace NActors::NWorkStealing {
                     // Time slice expired — check if queue has other work
                     auto next = slot.Pop();
                     if (next) {
+                        // Push current to queue tail for fair interleaving.
+                        // Only budget-exhaustion leftovers go to the ring
+                        // (proven hottest — survived the entire budget).
                         slot.Push(*activation);
                         activation = next;
                         break;
@@ -153,12 +120,19 @@ namespace NActors::NWorkStealing {
                 activation.reset();
             }
         }
-        // Save Phase 2 leftover as hot continuation for the next PollSlot.
-        // Only Phase 2 can create continuations — Phase 1 is one-shot.
+
+        // Save leftover to ring for next PollSlot's seeding.
         if (activation) {
-            pollState.HotContinuation = activation;
-            slot.Counters.HotContinuations.fetch_add(1, std::memory_order_relaxed);
+            if (!pollState.Ring.Push(*activation)) {
+                slot.Push(*activation);
+                slot.Counters.RingOverflows.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                slot.Counters.HotContinuations.fetch_add(1, std::memory_order_relaxed);
+            }
         }
+
+        // Update ring occupancy for router visibility
+        slot.ContinuationCount.store(pollState.Ring.Size(), std::memory_order_relaxed);
 
         if (didWork) {
             slot.Counters.BusyPolls.fetch_add(1, std::memory_order_relaxed);
@@ -169,7 +143,7 @@ namespace NActors::NWorkStealing {
             return EPollResult::Busy;
         }
 
-        // No work found in Phase 1 or Phase 2. Try stealing from neighbor
+        // No work found locally. Try stealing from neighbor
         // slots with exponential backoff on consecutive idle polls.
         ++pollState.ConsecutiveIdle;
 

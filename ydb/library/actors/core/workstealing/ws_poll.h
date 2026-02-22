@@ -41,49 +41,92 @@ namespace NActors::NWorkStealing {
     // calls — one GetCycleCountFast() per event total.
     using TExecuteCallback = std::function<bool(ui32 hint, NHPTimer::STime& hpnow)>;
 
+    // Callback for ring overflow — reroutes activation to another slot.
+    using TOverflowCallback = std::function<void(ui32 hint)>;
+
+    // Stack-allocated fixed-capacity FIFO ring for hot continuations.
+    // Single-threaded — accessed only by the owning worker.
+    struct TContinuationRing {
+        static constexpr uint8_t kMaxCapacity = 8;
+
+        bool Empty() const { return Count == 0; }
+        bool Full() const { return Count >= Capacity; }
+        uint8_t Size() const { return Count; }
+
+        bool Push(ui32 activation) {
+            if (Full()) {
+                return false;
+            }
+            Items[Tail] = activation;
+            Tail = (Tail + 1) % kMaxCapacity;
+            ++Count;
+            return true;
+        }
+
+        std::optional<ui32> Pop() {
+            if (Empty()) {
+                return std::nullopt;
+            }
+            ui32 val = Items[Head];
+            Head = (Head + 1) % kMaxCapacity;
+            --Count;
+            return val;
+        }
+
+        void FlushTo(TSlot& slot) {
+            while (!Empty()) {
+                slot.Push(*Pop());
+            }
+        }
+
+        ui32 Items[kMaxCapacity] = {};
+        uint8_t Head = 0;
+        uint8_t Tail = 0;
+        uint8_t Count = 0;
+        uint8_t Capacity = 4;  // set from TWsConfig::ContinuationRingCapacity
+    };
+
     // Per-slot polling state, persists across PollSlot calls within a worker.
     //
     // Tracks steal backoff (ConsecutiveIdle, NextStealAtIdle, StealInterval)
-    // and the hot continuation — a mailbox that exhausted Phase 2's event
-    // budget while still having work. The continuation receives priority
-    // processing on the next PollSlot call (Phase 1).
+    // and the continuation ring — mailboxes that exhausted their time budget
+    // while still having work. Ring items are interleaved with queue items
+    // on subsequent PollSlot calls for fair execution.
     //
-    // INVARIANT: A mailbox in HotContinuation is still locked. The worker
-    // MUST flush it (push to queue) before parking, draining, or shutting
+    // INVARIANT: Mailboxes in the ring are still locked. The worker
+    // MUST flush them (push to queue) before parking, draining, or shutting
     // down. See thread_driver.cpp for flush points.
     struct TPollState {
         uint32_t ConsecutiveIdle = 0;
         uint32_t NextStealAtIdle = 0; // next ConsecutiveIdle value at which to attempt stealing
         uint32_t StealInterval = 0;   // current interval between steal attempts (exponential backoff)
         bool HadLocalWork = false;    // set by PollSlot: true = local work executed, false = stolen or idle
-        std::optional<ui32> HotContinuation; // Phase 2 leftover: activation that still has events
+        TContinuationRing Ring;       // hot continuations: activations that survived time budget
     };
 
-    // Core polling routine for a single slot. Two-phase execution with
-    // one-shot hot continuation and time-based batching.
+    // Core polling routine for a single slot. Unified interleaved execution
+    // with continuation ring and time-based batching.
     //
-    // Phase 1 — Hot continuation (one-shot):
-    //   If HotContinuation is set, process it first with a fresh
-    //   MaxExecBatch budget. If it still has events, push to queue
-    //   (NOT saved back as continuation). Gives priority to hot
-    //   mailboxes without monopolizing Phase 1 across calls.
-    //
-    // Phase 2 — Queue processing:
-    //   Pop activations and execute with a separate MaxExecBatch budget.
-    //   Each mailbox runs for up to MailboxBatchCycles before checking
-    //   the queue for interleaving. If budget is exhausted while a
-    //   mailbox still has events, it becomes the next HotContinuation.
+    // Execution loop:
+    //   PopInterleaved alternates between ring (proven hot items) and queue
+    //   (new arrivals). Each activation runs for up to MailboxBatchCycles.
+    //   When time expires and other work is available, the current activation
+    //   is saved to ring tail and the next item is executed (inline swap).
+    //   If nothing else is available, the same activation continues with a
+    //   reset deadline. Budget exhaustion saves to ring; ring full triggers
+    //   overflow callback for redistribution.
     //
     // Stealing:
-    //   If both phases found no work, try stealing from neighbors via
-    //   stealIterator with exponential backoff. Stolen items are
-    //   executed directly from a stack buffer (no reinjection).
+    //   If no work found, try stealing from neighbors via stealIterator
+    //   with exponential backoff. Stolen items are executed directly from
+    //   a stack buffer (no reinjection).
     //
     // Returns Busy if any event was processed, Idle otherwise.
     EPollResult PollSlot(
         TSlot& slot,
         IStealIterator* stealIterator,
         const TExecuteCallback& executeCallback,
+        const TOverflowCallback& overflowCallback,
         const TWsConfig& config,
         TPollState& pollState);
 

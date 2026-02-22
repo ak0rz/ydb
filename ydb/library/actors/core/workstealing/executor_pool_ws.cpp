@@ -117,6 +117,17 @@ namespace NActors::NWorkStealing {
                     DeferredReinjection = nullptr;
                     return true;
                 };
+                callbacks.Overflow = [this, mboxTable](ui32 hint) {
+                    // Reset sticky routing — this activation is being load-shed
+                    if (auto* mailbox = mboxTable->Get(hint)) {
+                        mailbox->LastPoolSlotIdx = 0;
+                    }
+                    // Fresh power-of-two routing to least-loaded slot
+                    int target = Router_->Route(hint, 0);
+                    if (target >= 0 && Driver_) {
+                        Driver_->WakeSlot(&Slots_[target]);
+                    }
+                };
                 callbacks.Setup = [ctx]() {
                     ctx->SetupTLS();
                 };
