@@ -25,6 +25,7 @@ SRCS(
     thread_driver_ut.cpp
     topology_ut.cpp
     ws_adaptive_scaler_ut.cpp
+    ws_bucket_map_ut.cpp
     ws_executor_context_ut.cpp
     ws_poll_ut.cpp
     ws_slot_ut.cpp

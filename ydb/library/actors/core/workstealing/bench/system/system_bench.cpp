@@ -93,6 +93,7 @@ namespace {
     }
 
     bool GAdaptive = false;
+    bool GSlotBucketing = false;
 
     THolder<NActors::TActorSystemSetup> MakeWSSetup(i16 slots, ui64 spinThresholdCycles = 0) {
         auto setup = MakeHolder<NActors::TActorSystemSetup>();
@@ -124,6 +125,9 @@ namespace {
         if (GAdaptive) {
             wsCfg.WsConfig.AdaptiveScaling = true;
             wsCfg.MinSlotCount = 1;
+        }
+        if (GSlotBucketing) {
+            wsCfg.WsConfig.SlotBucketing = true;
         }
         setup->CpuManager.WorkStealing = NActors::TWorkStealingConfig{
             .Enabled = true,
@@ -419,6 +423,39 @@ namespace {
         }
 
         std::atomic<ui64>& Counter_;
+    };
+
+    // -------------------------------------------------------------------
+    // Heavy CPU-bound actor for bucket-proof scenario
+    // -------------------------------------------------------------------
+
+    class THeavyCpuActor: public NActors::TActor<THeavyCpuActor> {
+    public:
+        THeavyCpuActor(ui64 workIters, std::atomic<ui64>& counter, std::atomic<bool>& stop)
+            : TActor(&THeavyCpuActor::StateFunc)
+            , WorkIters_(workIters)
+            , Counter_(counter)
+            , Stop_(stop)
+        {}
+
+        STFUNC(StateFunc) {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvBenchMsg, Handle);
+            }
+        }
+
+    private:
+        void Handle(TEvBenchMsg::TPtr& /*ev*/) {
+            BusyWork(WorkIters_);
+            Counter_.fetch_add(1, std::memory_order_relaxed);
+            if (!Stop_.load(std::memory_order_relaxed)) {
+                Send(SelfId(), new TEvBenchMsg());
+            }
+        }
+
+        ui64 WorkIters_;
+        std::atomic<ui64>& Counter_;
+        std::atomic<bool>& Stop_;
     };
 
     // -------------------------------------------------------------------
@@ -766,6 +803,9 @@ namespace {
             }
             if (mp.Adaptive) {
                 cfg.WsConfig.AdaptiveScaling = true;
+            }
+            if (GSlotBucketing) {
+                cfg.WsConfig.SlotBucketing = true;
             }
             return cfg;
         };
@@ -1790,6 +1830,101 @@ namespace {
     }
 
     // -------------------------------------------------------------------
+    // Bucket-proof benchmark: demonstrates latency isolation via bucketing
+    //
+    // Mixed workload: 8 fast ping-pong pairs + 8 heavy CPU-bound actors
+    // on a single pool. With bucketing, fast actors get isolated in the
+    // fast bucket, maintaining low latency despite heavy actors.
+    // -------------------------------------------------------------------
+
+    void RunBucketProof(ui32 threads, ui32 warmupSec, ui32 durationSec) {
+        std::fprintf(stderr, "\n=== Bucket Proof: %u threads, slot-bucketing=%s ===\n\n",
+                     threads, GSlotBucketing ? "on" : "off");
+
+        auto setup = MakeWSSetup(threads, GSpinThresholdCycles);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = 1; // WS pool
+
+        std::atomic<ui64> fastCounter{0};
+        std::atomic<ui64> heavyCounter{0};
+        std::atomic<bool> stop{false};
+
+        // Create 8 fast ping-pong pairs
+        ui32 fastPairs = 8;
+        for (ui32 i = 0; i < fastPairs; ++i) {
+            auto* pong = new TPongActor(fastCounter, stop);
+            NActors::TActorId pongId = sys.Register(pong, NActors::TMailboxType::HTSwap, pool);
+            auto* ping = new TPingActor(pongId, fastCounter, stop);
+            NActors::TActorId pingId = sys.Register(ping, NActors::TMailboxType::HTSwap, pool);
+            pong->SetPeer(pingId);
+            sys.Send(pingId, new TEvBenchPing());
+        }
+
+        // Create 8 heavy CPU-bound actors (~50us/event at 3GHz ≈ 150000 cycles)
+        ui32 heavyActors = 8;
+        ui64 heavyWorkIters = 50000; // ~50us of CPU work
+        for (ui32 i = 0; i < heavyActors; ++i) {
+            auto* heavy = new THeavyCpuActor(heavyWorkIters, heavyCounter, stop);
+            NActors::TActorId heavyId = sys.Register(heavy, NActors::TMailboxType::HTSwap, pool);
+            sys.Send(heavyId, new TEvBenchMsg());
+        }
+
+        // Warmup
+        std::fprintf(stderr, "Warming up %u seconds...\n", warmupSec);
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        fastCounter.store(0, std::memory_order_relaxed);
+        heavyCounter.store(0, std::memory_order_relaxed);
+        ResetWsCounters();
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double cpuSeconds = cpuAfter - cpuBefore;
+
+        ui64 fastOps = fastCounter.load(std::memory_order_relaxed);
+        ui64 heavyOps = heavyCounter.load(std::memory_order_relaxed);
+
+        double fastOpsPerSec = (elapsed > 0) ? (double)fastOps / elapsed : 0;
+        double heavyOpsPerSec = (elapsed > 0) ? (double)heavyOps / elapsed : 0;
+        double fastLatencyUs = (fastOps > 0) ? (elapsed * 1e6 / fastOps) : 0;
+
+        // CSV output
+        std::printf("pool_type,scenario,workload,threads,bucketing,ops_per_sec,avg_latency_us,cpu_seconds\n");
+        std::printf("ws,bucket-proof,fast-ping-pong,%u,%s,%.0f,%.2f,%.2f\n",
+                    threads, GSlotBucketing ? "on" : "off",
+                    fastOpsPerSec, fastLatencyUs, cpuSeconds);
+        std::printf("ws,bucket-proof,heavy-cpu,%u,%s,%.0f,0,%.2f\n",
+                    threads, GSlotBucketing ? "on" : "off",
+                    heavyOpsPerSec, cpuSeconds);
+        std::fflush(stdout);
+
+        // Stderr: WS counters
+        char label[128];
+        std::snprintf(label, sizeof(label), "ws/bucket-proof t=%u bucketing=%s",
+                      threads, GSlotBucketing ? "on" : "off");
+        DumpWsCounters(label);
+
+        std::fprintf(stderr, "\n  fast-ping-pong: %.0f ops/sec  (avg latency %.2f us)\n",
+                     fastOpsPerSec, fastLatencyUs);
+        std::fprintf(stderr, "  heavy-cpu:      %.0f ops/sec\n", heavyOpsPerSec);
+        std::fprintf(stderr, "  CPU-seconds: %.2f  utilization: %.1f%%\n",
+                     cpuSeconds,
+                     (elapsed > 0 && threads > 0)
+                         ? (cpuSeconds / (elapsed * threads) * 100.0) : 0.0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sys.Stop();
+    }
+
+    // -------------------------------------------------------------------
     // Single-pool topology proof (original scenario)
     // -------------------------------------------------------------------
 
@@ -2017,7 +2152,7 @@ int main(int argc, const char* argv[]) {
 
     TString scenario = "all";
     opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, "
-        "storage-node, topology-proof, multi-pool, multi-pool-topology, mixed-pool, or all")
+        "storage-node, topology-proof, multi-pool, multi-pool-topology, mixed-pool, bucket-proof, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -2055,6 +2190,11 @@ int main(int argc, const char* argv[]) {
     opts.AddLongOption("adaptive", "Enable adaptive slot scaling for WS pool")
         .NoArgument()
         .SetFlag(&adaptive);
+
+    bool slotBucketing = false;
+    opts.AddLongOption("slot-bucketing", "Enable adaptive slot bucketing (fast/heavy isolation)")
+        .NoArgument()
+        .SetFlag(&slotBucketing);
 
     // Storage-node scenario parameters
     ui32 vdisks = 8;
@@ -2134,6 +2274,7 @@ int main(int argc, const char* argv[]) {
     GSpinThresholdCycles = spinThreshold;
     GMinSpinThresholdCycles = minSpinThreshold;
     GAdaptive = adaptive;
+    GSlotBucketing = slotBucketing;
 
     auto threads = ParseList(threadsList);
     auto pairs = ParseList(pairsList);
@@ -2174,6 +2315,14 @@ int main(int argc, const char* argv[]) {
     std::printf("pool_type,scenario,threads,actor_pairs,ops_per_sec,avg_latency_us,cpu_seconds,cpu_util_pct\n");
 
     // Special scenarios that run once and exit
+    if (scenario == "bucket-proof") {
+        if (threads.empty()) {
+            threads = {64};
+        }
+        RunBucketProof(threads[0], warmupSec, durationSec);
+        return 0;
+    }
+
     if (scenario == "topology-proof") {
         if (threads.empty()) {
             threads = {384};

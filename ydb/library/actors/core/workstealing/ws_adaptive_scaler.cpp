@@ -1,4 +1,5 @@
 #include "ws_adaptive_scaler.h"
+#include "ws_bucket_map.h"
 
 #include <ydb/library/actors/util/datetime.h>
 
@@ -17,6 +18,10 @@ namespace NActors::NWorkStealing {
         , MaxSlotCount_(maxSlotCount)
         , Config_(config)
     {
+    }
+
+    void TAdaptiveScaler::SetBucketMap(TBucketMap* bucketMap) {
+        BucketMap_ = bucketMap;
     }
 
     void TAdaptiveScaler::Evaluate() {
@@ -87,6 +92,12 @@ namespace NActors::NWorkStealing {
                 LastChangeCycles_ = now;
                 ++DeflateEvents_;
             }
+        }
+
+        // Bucket reclassification: the bucket map handles its own boundary
+        // management internally (demand-driven based on heavy actor count).
+        if (BucketMap_) {
+            BucketMap_->Reclassify();
         }
     }
 

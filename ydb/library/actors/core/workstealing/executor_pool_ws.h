@@ -4,6 +4,7 @@
 #include "ws_config.h"
 #include "ws_counters.h"
 #include "ws_adaptive_scaler.h"
+#include "ws_bucket_map.h"
 #include "activation_router.h"
 #include "driver.h"
 #include "ws_executor_context.h"
@@ -131,6 +132,9 @@ namespace NActors::NWorkStealing {
 
         // Adaptive slot scaler (created in Prepare when AdaptiveScaling=true)
         std::unique_ptr<TAdaptiveScaler> AdaptiveScaler_;
+
+        // Adaptive slot bucket map (created in Prepare when SlotBucketing=true)
+        std::unique_ptr<TBucketMap> BucketMap_;
     };
 
 } // namespace NActors::NWorkStealing

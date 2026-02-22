@@ -1,4 +1,5 @@
 #include "ws_executor_context.h"
+#include "ws_bucket_map.h"
 
 #include <ydb/library/actors/core/actor.h>
 #include <ydb/library/actors/core/actorsystem.h>
@@ -150,6 +151,9 @@ namespace NActors::NWorkStealing {
         }
 
         if (mailbox->IsFree() && mailbox->CanReclaim()) {
+            if (BucketMap_) {
+                BucketMap_->ResetBucket(mailbox->Hint);
+            }
             ThreadCtx.FreeMailbox(mailbox);
         } else if (!mailbox->IsFree()) {
             mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);

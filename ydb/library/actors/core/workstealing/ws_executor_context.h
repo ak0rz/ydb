@@ -8,6 +8,8 @@ namespace NActors {
 
 namespace NActors::NWorkStealing {
 
+    class TBucketMap;
+
     // TWSExecutorContext inherits TExecutorThread but is never started as a thread.
     //
     // Each Driver worker holds one TWSExecutorContext per assigned pool.
@@ -53,8 +55,12 @@ namespace NActors::NWorkStealing {
         // Unlocks or frees the mailbox as appropriate.
         void FinishMailbox(TMailbox* mailbox);
 
+        void SetBucketMap(TBucketMap* bucketMap) { BucketMap_ = bucketMap; }
+
         // Do NOT start the thread.
         // TThread::Start() is never called.
+    private:
+        TBucketMap* BucketMap_ = nullptr;
     };
 
 } // namespace NActors::NWorkStealing

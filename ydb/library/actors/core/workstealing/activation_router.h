@@ -9,6 +9,8 @@
 
 namespace NActors::NWorkStealing {
 
+    class TBucketMap;
+
     // Routes mailbox activations to slots using sticky routing with
     // hash-based power-of-two random fallback.
     //
@@ -21,9 +23,16 @@ namespace NActors::NWorkStealing {
     // 3. If zero or target slot not Active: power-of-two hash choice
     //    - Derive 2 candidate slots from hint, choose the one with lower SizeEstimate()
     // 4. Push into chosen slot's MPMC queue
+    //
+    // When bucket map is set, routing is constrained to bucket slot ranges:
+    //   bucket 0 (fast):  slots [0, BucketBoundary)
+    //   bucket 1 (heavy): slots [BucketBoundary, ActiveCount)
     class TActivationRouter {
     public:
         TActivationRouter(TSlot* slots, size_t slotCount);
+
+        // Set bucket map for bucket-aware routing (nullptr = disabled)
+        void SetBucketMap(TBucketMap* bucketMap);
 
         // Route an activation to a slot. Returns the slot index chosen,
         // or -1 if no active slot is available.
@@ -37,8 +46,9 @@ namespace NActors::NWorkStealing {
         TSlot* Slots_;
         size_t SlotCount_;
         std::atomic<ui16> ActiveCount_{0};
+        TBucketMap* BucketMap_ = nullptr;
 
-        int PowerOfTwoHash(ui32 hint, ui16 activeCount);
+        int PowerOfTwoHash(ui32 hint, ui16 begin, ui16 end);
     };
 
 } // namespace NActors::NWorkStealing

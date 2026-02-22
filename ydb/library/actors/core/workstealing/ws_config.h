@@ -5,6 +5,8 @@
 
 namespace NActors::NWorkStealing {
 
+    struct TBucketConfig;
+
     struct TWsConfig {
         size_t MaxExecBatch = 64;             // max events to execute per PollSlot call
         uint64_t MailboxBatchCycles = 50000;    // max cycles per mailbox before push-back (~17us at 3GHz)
@@ -28,6 +30,14 @@ namespace NActors::NWorkStealing {
         double SlotBusyThreshold = 0.1;             // slot considered "busy" above 10% util
         uint32_t QueuePressureThreshold = 16;       // inflate if any slot queue depth >16
         uint64_t AdaptiveParkNs = 50000;              // 50us — timed park for eval worker
+
+        // Adaptive slot bucketing
+        bool SlotBucketing = false;                    // master switch
+        uint64_t BucketCostThresholdCycles = 100000;   // above → heavy bucket (~33us at 3GHz)
+        uint64_t BucketDowngradeThresholdCycles = 50000; // below → fast (hysteresis)
+        uint32_t BucketMinSamples = 64;                // events before classification
+        uint16_t BucketEmaAlphaQ16 = 6554;             // ~0.1 in Q16.16
+        uint16_t BucketMinActiveSlots = 4;               // disable bucketing below this many active slots
     };
 
 } // namespace NActors::NWorkStealing

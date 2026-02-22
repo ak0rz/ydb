@@ -14,6 +14,8 @@
 
 namespace NActors::NWorkStealing {
 
+    class TBucketMap;
+
     // Thread-based driver implementation.
     // Creates one worker thread per slot (for simplicity in the first iteration).
     // Workers are CPU-pinned and poll their assigned slot.
@@ -37,6 +39,9 @@ namespace NActors::NWorkStealing {
 
         std::unique_ptr<IStealIterator> MakeStealIterator(TSlot* exclude) override;
 
+        // Set bucket map for bucket-aware steal ordering (nullptr = disabled)
+        void SetBucketMap(TBucketMap* bucketMap);
+
     private:
         struct TWorker {
             TSlot* Slot = nullptr;
@@ -57,6 +62,7 @@ namespace NActors::NWorkStealing {
 
         TWsConfig Config_;
         TCpuTopology Topology_;
+        TBucketMap* BucketMap_ = nullptr;
 
         std::vector<std::unique_ptr<TWorker>> Workers_;
         std::vector<TSlot*> AllSlots_; // all registered slots

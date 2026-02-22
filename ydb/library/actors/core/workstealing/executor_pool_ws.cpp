@@ -1,5 +1,8 @@
 #include "executor_pool_ws.h"
+#include "thread_driver.h"
 
+#include <ydb/library/actors/core/actor.h>
+#include <ydb/library/actors/core/actor_class_stats.h>
 #include <ydb/library/actors/core/actorsystem.h>
 #include <ydb/library/actors/core/mailbox_lockfree.h>
 #include <ydb/library/actors/util/datetime.h>
@@ -110,6 +113,7 @@ namespace NActors::NWorkStealing {
                     CurrentlyExecutingMailbox = mailbox;
                     DeferredReinjection = nullptr;
 
+                    NHPTimer::STime hpBefore = hpnow;
                     bool processed = ctx->ExecuteSingleEvent(mailbox, hpnow);
 
                     // Stamp affinity BEFORE any unlock — after unlock another
@@ -128,6 +132,12 @@ namespace NActors::NWorkStealing {
                             pool->RouteActivation(deferred);
                         }
                         return false;
+                    }
+
+                    // Inline bucket eviction: update bucket stats after each event
+                    if (pool->BucketMap_) {
+                        uint64_t eventCycles = static_cast<uint64_t>(hpnow - hpBefore);
+                        pool->BucketMap_->UpdateAfterExecution(hint, eventCycles);
                     }
 
                     // Event processed, mailbox stays locked for more.
@@ -174,12 +184,44 @@ namespace NActors::NWorkStealing {
         // Create the activation router
         Router_ = std::make_unique<TActivationRouter>(Slots_.data(), Slots_.size());
 
+        // Create bucket map if bucketing is enabled
+        if (WsConfig_.SlotBucketing) {
+            TBucketConfig bucketConfig;
+            bucketConfig.CostThresholdCycles = WsConfig_.BucketCostThresholdCycles;
+            bucketConfig.DowngradeThresholdCycles = WsConfig_.BucketDowngradeThresholdCycles;
+            bucketConfig.MinSamplesForClassification = WsConfig_.BucketMinSamples;
+            bucketConfig.EmaAlphaQ16 = WsConfig_.BucketEmaAlphaQ16;
+            bucketConfig.MinActiveForBucketing = WsConfig_.BucketMinActiveSlots;
+
+            BucketMap_ = std::make_unique<TBucketMap>(MailboxTable, bucketConfig);
+
+            // Initial state: boundary=0 (all fast, no partitioning).
+            // Reclassify() will set the boundary once heavy actors are detected.
+            BucketMap_->SetActiveCount(static_cast<ui16>(DefaultSlotCount_));
+
+            Router_->SetBucketMap(BucketMap_.get());
+
+            for (auto& ctx : Contexts_) {
+                ctx->SetBucketMap(BucketMap_.get());
+            }
+
+            if (Driver_) {
+                // Dynamic cast not available; use static interface
+                // TThreadDriver is the only IDriver implementation
+                static_cast<TThreadDriver*>(Driver_)->SetBucketMap(BucketMap_.get());
+            }
+        }
+
         // Create adaptive scaler if enabled
         if (WsConfig_.AdaptiveScaling) {
             AdaptiveScaler_ = std::make_unique<TAdaptiveScaler>(
                 [this](i16 threads) { SetFullThreadCount(threads); },
                 [this]() -> i16 { return ActiveSlotCount_.load(std::memory_order_relaxed); },
                 Slots_.data(), MaxSlotCount_, WsConfig_);
+
+            if (BucketMap_) {
+                AdaptiveScaler_->SetBucketMap(BucketMap_.get());
+            }
         }
     }
 
@@ -236,6 +278,29 @@ namespace NActors::NWorkStealing {
 
         if (auto* stats = MailboxTable->GetStats(mailbox->Hint)) {
             stats->ActivationCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Bucket prediction for unclassified mailboxes
+        if (BucketMap_) {
+            if (!BucketMap_->IsClassified(mailbox->Hint)) {
+                // Try to predict from actor-class stats
+                ui32 hint = mailbox->Hint;
+                mailbox->ForEach([this, hint](ui64 /*actorId*/, IActor* actor) {
+                    if (!actor) return;
+                    if (auto* cs = actor->GetClassStats()) {
+                        ui64 msgs = cs->MessagesProcessed.load(std::memory_order_relaxed);
+                        if (msgs > 0) {
+                            ui64 cycles = cs->ExecutionCycles.load(std::memory_order_relaxed);
+                            uint8_t predicted = BucketMap_->PredictFromClassCost(cycles / msgs);
+                            if (predicted != 0) {
+                                BucketMap_->SetBucket(hint, predicted);
+                            }
+                        }
+                    }
+                });
+            }
+
+            BucketMap_->TrackActive(mailbox->Hint);
         }
 
         int slotIdx = Router_->Route(mailbox->Hint, mailbox->LastPoolSlotIdx);
@@ -326,6 +391,11 @@ namespace NActors::NWorkStealing {
         // Refresh the router's view of active slots
         if (Router_) {
             Router_->RefreshActiveSlots();
+        }
+
+        // Update bucket map's active count (it recomputes boundary internally)
+        if (BucketMap_) {
+            BucketMap_->SetActiveCount(static_cast<ui16>(threads));
         }
     }
 

@@ -1,4 +1,5 @@
 #include "thread_driver.h"
+#include "ws_bucket_map.h"
 
 #include <ydb/library/actors/util/affinity.h>
 #include <ydb/library/actors/util/datetime.h>
@@ -204,6 +205,10 @@ namespace NActors::NWorkStealing {
         }
     }
 
+    void TThreadDriver::SetBucketMap(TBucketMap* bucketMap) {
+        BucketMap_ = bucketMap;
+    }
+
     std::unique_ptr<IStealIterator> TThreadDriver::MakeStealIterator(TSlot* exclude) {
         auto* worker = static_cast<TWorker*>(exclude->DriverData);
         if (!worker || Groups_.empty()) {
@@ -213,8 +218,6 @@ namespace NActors::NWorkStealing {
         // Build slot list from same group only, excluding self.
         // Start from worker's position + 1, wrap around (closest neighbors first).
         auto& group = Groups_[worker->GroupIndex];
-        std::vector<TSlot*> groupSlots;
-        groupSlots.reserve(group.Workers.size() - 1);
 
         size_t selfPos = 0;
         for (size_t i = 0; i < group.Workers.size(); ++i) {
@@ -223,6 +226,40 @@ namespace NActors::NWorkStealing {
                 break;
             }
         }
+
+        // When bucketing is active, partition neighbors: same-bucket first,
+        // then cross-bucket. Layout: heavy=[0,boundary), fast=[boundary,active).
+        if (BucketMap_) {
+            ui16 boundary = BucketMap_->GetBucketBoundary();
+            bool selfIsHeavy = (selfPos < static_cast<size_t>(boundary));
+
+            std::vector<TSlot*> sameBucket;
+            std::vector<TSlot*> crossBucket;
+
+            for (size_t j = 1; j < group.Workers.size(); ++j) {
+                size_t idx = (selfPos + j) % group.Workers.size();
+                TSlot* neighbor = group.Workers[idx]->Slot;
+                bool neighborIsHeavy = (idx < static_cast<size_t>(boundary));
+
+                if (neighborIsHeavy == selfIsHeavy) {
+                    sameBucket.push_back(neighbor);
+                } else {
+                    crossBucket.push_back(neighbor);
+                }
+            }
+
+            // Concatenate: same-bucket first, then cross-bucket
+            std::vector<TSlot*> ordered;
+            ordered.reserve(sameBucket.size() + crossBucket.size());
+            ordered.insert(ordered.end(), sameBucket.begin(), sameBucket.end());
+            ordered.insert(ordered.end(), crossBucket.begin(), crossBucket.end());
+
+            return std::make_unique<TTopologyStealIterator>(std::move(ordered), Config_.MaxStealNeighbors);
+        }
+
+        // No bucketing: standard circular neighbor list
+        std::vector<TSlot*> groupSlots;
+        groupSlots.reserve(group.Workers.size() - 1);
         for (size_t j = 1; j < group.Workers.size(); ++j) {
             size_t idx = (selfPos + j) % group.Workers.size();
             groupSlots.push_back(group.Workers[idx]->Slot);
