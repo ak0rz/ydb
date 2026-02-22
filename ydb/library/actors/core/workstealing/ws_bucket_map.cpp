@@ -23,23 +23,23 @@ namespace NActors::NWorkStealing {
 
     // --- TBucketMap ---
 
-    TBucketMap::TBucketMap(TMailboxTable* mboxTable, const TBucketConfig& config)
+    TBucketMap::TBucketMap(TWsMailboxTable* mboxTable, const TBucketConfig& config)
         : MailboxTable_(mboxTable)
         , Config_(config)
     {
-        Lines_.reset(new std::atomic<TBucketLine*>[TMailboxTable::LinesCount]{});
+        Lines_.reset(new std::atomic<TBucketLine*>[TWsMailboxTable::LinesCount]{});
         ActiveHints_.Clear();
     }
 
     TBucketMap::~TBucketMap() {
-        for (size_t i = 0; i < TMailboxTable::LinesCount; ++i) {
+        for (size_t i = 0; i < TWsMailboxTable::LinesCount; ++i) {
             delete Lines_[i].load(std::memory_order_relaxed);
         }
     }
 
     TMailboxBucketInfo* TBucketMap::GetBucketInfo(ui32 hint) {
-        ui32 lineIndex = (hint >> TMailboxTable::LineIndexShift) & TMailboxTable::LineIndexMask;
-        if (lineIndex >= TMailboxTable::LinesCount) [[unlikely]] {
+        ui32 lineIndex = (hint >> TWsMailboxTable::LineIndexShift) & TWsMailboxTable::LineIndexMask;
+        if (lineIndex >= TWsMailboxTable::LinesCount) [[unlikely]] {
             return nullptr;
         }
 
@@ -57,12 +57,12 @@ namespace NActors::NWorkStealing {
             }
         }
 
-        return &line->Infos[hint & TMailboxTable::MailboxIndexMask];
+        return &line->Infos[hint & TWsMailboxTable::MailboxIndexMask];
     }
 
     const TMailboxBucketInfo* TBucketMap::GetBucketInfo(ui32 hint) const {
-        ui32 lineIndex = (hint >> TMailboxTable::LineIndexShift) & TMailboxTable::LineIndexMask;
-        if (lineIndex >= TMailboxTable::LinesCount) [[unlikely]] {
+        ui32 lineIndex = (hint >> TWsMailboxTable::LineIndexShift) & TWsMailboxTable::LineIndexMask;
+        if (lineIndex >= TWsMailboxTable::LinesCount) [[unlikely]] {
             return nullptr;
         }
 
@@ -71,7 +71,7 @@ namespace NActors::NWorkStealing {
             return nullptr; // const path doesn't allocate
         }
 
-        return &line->Infos[hint & TMailboxTable::MailboxIndexMask];
+        return &line->Infos[hint & TWsMailboxTable::MailboxIndexMask];
     }
 
     uint8_t TBucketMap::GetBucket(ui32 hint) const {
@@ -130,15 +130,15 @@ namespace NActors::NWorkStealing {
     }
 
     void TBucketMap::ResetBucket(ui32 hint) {
-        ui32 lineIndex = (hint >> TMailboxTable::LineIndexShift) & TMailboxTable::LineIndexMask;
-        if (lineIndex >= TMailboxTable::LinesCount) [[unlikely]] {
+        ui32 lineIndex = (hint >> TWsMailboxTable::LineIndexShift) & TWsMailboxTable::LineIndexMask;
+        if (lineIndex >= TWsMailboxTable::LinesCount) [[unlikely]] {
             return;
         }
         auto* line = Lines_[lineIndex].load(std::memory_order_acquire);
         if (!line) {
             return;
         }
-        auto& info = line->Infos[hint & TMailboxTable::MailboxIndexMask];
+        auto& info = line->Infos[hint & TWsMailboxTable::MailboxIndexMask];
         info.BucketId.store(0, std::memory_order_relaxed);
         info.Classified.store(0, std::memory_order_relaxed);
         info.EmaAvgCostQ16.store(0, std::memory_order_relaxed);

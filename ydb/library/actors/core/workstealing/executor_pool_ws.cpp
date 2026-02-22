@@ -5,6 +5,7 @@
 #include <ydb/library/actors/core/actor_class_stats.h>
 #include <ydb/library/actors/core/actorsystem.h>
 #include <ydb/library/actors/core/mailbox_lockfree.h>
+#include <ydb/library/actors/core/probes.h>
 #include <ydb/library/actors/util/datetime.h>
 
 #include <algorithm>
@@ -90,10 +91,19 @@ namespace NActors::NWorkStealing {
             Contexts_.push_back(std::make_unique<TWSExecutorContext>(i, actorSystem, this));
         }
 
-        // Wire MailboxTable onto each slot for cost-aware stealing
-        TMailboxTable* mboxTable = MailboxTable;
+        // Create TWsMailboxTable (flatter segments, index-based free lists)
+        WsMailboxTable_ = std::make_unique<TWsMailboxTable>();
+        auto* wsTable = WsMailboxTable_.get();
+
+        // Create per-slot allocators
+        SlotAllocators_.resize(MaxSlotCount_);
         for (i16 i = 0; i < MaxSlotCount_; ++i) {
-            Slots_[i].MailboxTable = mboxTable;
+            SlotAllocators_[i].Init(wsTable);
+        }
+
+        // Wire WsMailboxTable onto each slot for cost-aware stealing
+        for (i16 i = 0; i < MaxSlotCount_; ++i) {
+            Slots_[i].WsMailboxTable = wsTable;
         }
 
         // Register all slots with the driver and wire per-worker callbacks
@@ -104,8 +114,8 @@ namespace NActors::NWorkStealing {
                 auto* ctx = Contexts_[i].get();
                 TWorkerCallbacks callbacks;
                 i16 slotIdx = i;
-                callbacks.Execute = [ctx, mboxTable, pool, slotIdx](ui32 hint, NHPTimer::STime& hpnow) -> bool {
-                    TMailbox* mailbox = mboxTable->Get(hint);
+                callbacks.Execute = [ctx, wsTable, pool, slotIdx](ui32 hint, NHPTimer::STime& hpnow) -> bool {
+                    TMailbox* mailbox = wsTable->Get(hint);
                     if (!mailbox) {
                         return false;
                     }
@@ -146,9 +156,9 @@ namespace NActors::NWorkStealing {
                     DeferredReinjection = nullptr;
                     return true;
                 };
-                callbacks.Overflow = [this, mboxTable](ui32 hint) {
+                callbacks.Overflow = [this, wsTable](ui32 hint) {
                     // Reset sticky routing — this activation is being load-shed
-                    if (auto* mailbox = mboxTable->Get(hint)) {
+                    if (auto* mailbox = wsTable->Get(hint)) {
                         mailbox->LastPoolSlotIdx = 0;
                     }
                     // Fresh power-of-two routing to least-loaded slot
@@ -193,7 +203,7 @@ namespace NActors::NWorkStealing {
             bucketConfig.EmaAlphaQ16 = WsConfig_.BucketEmaAlphaQ16;
             bucketConfig.MinActiveForBucketing = WsConfig_.BucketMinActiveSlots;
 
-            BucketMap_ = std::make_unique<TBucketMap>(MailboxTable, bucketConfig);
+            BucketMap_ = std::make_unique<TBucketMap>(wsTable, bucketConfig);
 
             // Initial state: boundary=0 (all fast, no partitioning).
             // Reclassify() will set the boundary once heavy actors are detected.
@@ -210,6 +220,12 @@ namespace NActors::NWorkStealing {
                 // TThreadDriver is the only IDriver implementation
                 static_cast<TThreadDriver*>(Driver_)->SetBucketMap(BucketMap_.get());
             }
+        }
+
+        // Wire WsMailboxTable and slot allocators into executor contexts
+        for (i16 i = 0; i < MaxSlotCount_; ++i) {
+            Contexts_[i]->SetWsMailboxTable(wsTable);
+            Contexts_[i]->SetSlotAllocator(&SlotAllocators_[i]);
         }
 
         // Create adaptive scaler if enabled
@@ -245,7 +261,137 @@ namespace NActors::NWorkStealing {
     }
 
     void TWSExecutorPool::Shutdown() {
-        // Driver manages worker threads; nothing to do here
+        // Drain slot allocators back to global pool
+        for (auto& alloc : SlotAllocators_) {
+            alloc.Drain();
+        }
+        // Driver manages worker threads; nothing else to do here
+    }
+
+    TMailbox* TWSExecutorPool::ResolveMailbox(ui32 hint) {
+        return WsMailboxTable_ ? WsMailboxTable_->Get(hint) : MailboxTable->Get(hint);
+    }
+
+    bool TWSExecutorPool::Send(std::unique_ptr<IEventHandle>& ev) {
+        Y_DEBUG_ABORT_UNLESS(ev->GetRecipientRewrite().PoolID() == PoolId);
+#ifdef ACTORSLIB_COLLECT_EXEC_STATS
+        RelaxedStore(&ev->SendTime, (::NHPTimer::STime)GetCycleCountFast());
+#endif
+        if (TlsThreadContext) {
+            TlsThreadContext->IsCurrentRecipientAService = ev->Recipient.IsService();
+        }
+
+        if (TMailbox* mailbox = WsMailboxTable_->Get(ev->GetRecipientRewrite().Hint())) {
+            switch (mailbox->Push(ev)) {
+                case EMailboxPush::Pushed:
+                    return true;
+                case EMailboxPush::Locked:
+                    mailbox->ScheduleMoment = GetCycleCountFast();
+                    ScheduleActivation(mailbox);
+                    return true;
+                case EMailboxPush::Free:
+                    break;
+            }
+        }
+
+        return false;
+    }
+
+    bool TWSExecutorPool::SpecificSend(std::unique_ptr<IEventHandle>& ev) {
+        Y_DEBUG_ABORT_UNLESS(ev->GetRecipientRewrite().PoolID() == PoolId);
+#ifdef ACTORSLIB_COLLECT_EXEC_STATS
+        RelaxedStore(&ev->SendTime, (::NHPTimer::STime)GetCycleCountFast());
+#endif
+        if (TlsThreadContext) {
+            TlsThreadContext->IsCurrentRecipientAService = ev->Recipient.IsService();
+        }
+
+        if (TMailbox* mailbox = WsMailboxTable_->Get(ev->GetRecipientRewrite().Hint())) {
+            switch (mailbox->Push(ev)) {
+                case EMailboxPush::Pushed:
+                    return true;
+                case EMailboxPush::Locked:
+                    mailbox->ScheduleMoment = GetCycleCountFast();
+                    SpecificScheduleActivation(mailbox);
+                    return true;
+                case EMailboxPush::Free:
+                    break;
+            }
+        }
+
+        return false;
+    }
+
+    TActorId TWSExecutorPool::Register(IActor* actor, TMailboxType::EType /*mailboxType*/, ui64 revolvingWriteCounter, const TActorId& parentId) {
+        NHPTimer::STime hpstart = GetCycleCountFast();
+#ifdef ACTORSLIB_COLLECT_EXEC_STATS
+        ui32 at = actor->GetActivityType().GetIndex();
+        Y_DEBUG_ABORT_UNLESS(at < Stats.ActorsAliveByActivity.size());
+        if (at >= Stats.MaxActivityType()) {
+            at = TActorTypeOperator::GetActorActivityIncorrectIndex();
+            Y_ABORT_UNLESS(at < Stats.ActorsAliveByActivity.size());
+        }
+        AtomicIncrement(Stats.ActorsAliveByActivity[at]);
+#endif
+        AtomicIncrement(ActorRegistrations);
+
+        // Determine slot from TLS (worker thread always knows its slot)
+        ui32 hint;
+        if (TlsThreadContext && TlsThreadContext->WorkerId() < static_cast<TWorkerId>(SlotAllocators_.size())) {
+            hint = SlotAllocators_[TlsThreadContext->WorkerId()].Allocate();
+        } else {
+            // External thread (system init) — fall back to global pool
+            size_t got = WsMailboxTable_->AllocateBatch(&hint, 1);
+            Y_ABORT_UNLESS(got > 0, "Failed to allocate mailbox hint");
+        }
+
+        TMailbox* mailbox = WsMailboxTable_->Get(hint);
+        Y_ABORT_UNLESS(mailbox);
+        mailbox->LockFromFree();
+
+        // Stamp initial execution end time so the first event's idle time
+        // is measured from allocation
+        if (auto* execStats = WsMailboxTable_->GetStats(mailbox->Hint)) {
+            execStats->LastExecutionEndCycles.store(GetCycleCountFast(), std::memory_order_relaxed);
+        }
+
+        const ui64 localActorId = AllocateID();
+        mailbox->AttachActor(localActorId, actor);
+
+        const TActorId actorId(ActorSystem->NodeId, PoolId, localActorId, mailbox->Hint);
+        DoActorInit(ActorSystem, actor, actorId, parentId);
+
+        // Stuck actor monitoring is handled by TExecutorPoolBaseMailboxed
+        // (accesses IActor::StuckIndex via friend declaration).
+        // WS Register bypasses that; monitoring uses standard counters.
+
+        // Once we unlock the mailbox the actor starts running
+        actor = nullptr;
+
+        mailbox->Unlock(this, GetCycleCountFast(), revolvingWriteCounter);
+
+        NHPTimer::STime elapsed = GetCycleCountFast() - hpstart;
+        (void)elapsed;
+
+        return actorId;
+    }
+
+    TActorId TWSExecutorPool::Register(IActor* actor, TMailboxCache& /*cache*/, ui64 revolvingWriteCounter, const TActorId& parentId) {
+        // WS pools ignore the cache; use slot allocator instead
+        return Register(actor, TMailboxType::LockFreeIntrusive, revolvingWriteCounter, parentId);
+    }
+
+    bool TWSExecutorPool::Cleanup() {
+        if (WsMailboxTable_) {
+            return WsMailboxTable_->Cleanup();
+        }
+        return MailboxTable->Cleanup();
+    }
+
+    TMailboxTable* TWSExecutorPool::GetMailboxTable() const {
+        // WS pools use WsMailboxTable; return nullptr to signal callers
+        // should not use the legacy TMailboxTable path.
+        return nullptr;
     }
 
     TMailbox* TWSExecutorPool::GetReadyActivation(ui64 /*revolvingCounter*/) {
@@ -276,7 +422,7 @@ namespace NActors::NWorkStealing {
             return;
         }
 
-        if (auto* stats = MailboxTable->GetStats(mailbox->Hint)) {
+        if (auto* stats = WsMailboxTable_->GetStats(mailbox->Hint)) {
             stats->ActivationCount.fetch_add(1, std::memory_order_relaxed);
         }
 

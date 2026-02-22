@@ -1,10 +1,7 @@
 #include "ws_slot.h"
-
-#include <ydb/library/actors/core/mailbox_lockfree.h>
+#include "ws_mailbox_table.h"
 
 #include <util/system/yassert.h>
-
-#include <algorithm>
 
 namespace NActors::NWorkStealing {
 
@@ -68,13 +65,15 @@ namespace NActors::NWorkStealing {
             out[count++] = *item;
 
             // Accumulate estimated cost from mailbox stats
-            if (MailboxTable) {
-                if (auto* stats = MailboxTable->GetStats(*item)) {
-                    ui64 events = stats->EventsProcessed.load(std::memory_order_relaxed);
-                    ui64 cycles = stats->TotalExecutionCycles.load(std::memory_order_relaxed);
-                    if (events > 0) {
-                        totalCost += static_cast<NHPTimer::STime>(cycles / events);
-                    }
+            TMailboxExecStats* stats = nullptr;
+            if (WsMailboxTable) {
+                stats = WsMailboxTable->GetStats(*item);
+            }
+            if (stats) {
+                ui64 events = stats->EventsProcessed.load(std::memory_order_relaxed);
+                ui64 cycles = stats->TotalExecutionCycles.load(std::memory_order_relaxed);
+                if (events > 0) {
+                    totalCost += static_cast<NHPTimer::STime>(cycles / events);
                 }
             }
             if (totalCost >= cyclesBudget) {

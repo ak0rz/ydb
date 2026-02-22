@@ -5,6 +5,7 @@
 #include "ws_counters.h"
 #include "ws_adaptive_scaler.h"
 #include "ws_bucket_map.h"
+#include "ws_mailbox_table.h"
 #include "activation_router.h"
 #include "driver.h"
 #include "ws_executor_context.h"
@@ -54,6 +55,13 @@ namespace NActors::NWorkStealing {
 
         // --- IExecutorPool ---
         TMailbox* GetReadyActivation(ui64 revolvingCounter) override;
+        TMailbox* ResolveMailbox(ui32 hint) override;
+        bool Send(std::unique_ptr<IEventHandle>& ev) override;
+        bool SpecificSend(std::unique_ptr<IEventHandle>& ev) override;
+        TActorId Register(IActor* actor, TMailboxType::EType mailboxType, ui64 revolvingWriteCounter, const TActorId& parentId) override;
+        TActorId Register(IActor* actor, TMailboxCache& cache, ui64 revolvingWriteCounter, const TActorId& parentId) override;
+        bool Cleanup() override;
+        TMailboxTable* GetMailboxTable() const override;
         void ScheduleActivation(TMailbox* mailbox) override;
         void SpecificScheduleActivation(TMailbox* mailbox) override;
         void ScheduleActivationEx(TMailbox* mailbox, ui64 revolvingCounter) override;
@@ -135,6 +143,10 @@ namespace NActors::NWorkStealing {
 
         // Adaptive slot bucket map (created in Prepare when SlotBucketing=true)
         std::unique_ptr<TBucketMap> BucketMap_;
+
+        // WS mailbox table: flatter segments, index-based free lists
+        std::unique_ptr<TWsMailboxTable> WsMailboxTable_;
+        TVector<TWsSlotAllocator> SlotAllocators_;
     };
 
 } // namespace NActors::NWorkStealing

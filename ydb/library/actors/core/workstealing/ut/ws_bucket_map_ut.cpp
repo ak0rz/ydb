@@ -1,6 +1,6 @@
 #include <ydb/library/actors/core/workstealing/ws_bucket_map.h>
+#include <ydb/library/actors/core/workstealing/ws_mailbox_table.h>
 #include <ydb/library/actors/core/workstealing/activation_router.h>
-#include <ydb/library/actors/core/mailbox_lockfree.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 
@@ -8,21 +8,14 @@ namespace NActors::NWorkStealing {
 
     namespace {
 
-        struct TTestMailboxTable {
-            std::unique_ptr<TMailboxTable> Table;
+        struct TTestWsMailboxTable {
+            TWsMailboxTable Table;
 
-            TTestMailboxTable() {
-                Table.reset(TMailboxTable::Create());
-            }
-
-            ~TTestMailboxTable() {
-                TMailboxTable::Destroy(Table.release());
-            }
-
-            // Allocate a mailbox and return its hint
+            // Allocate a mailbox hint via the table's global pool
             ui32 AllocateHint() {
-                TMailbox* mbox = Table->Allocate();
-                return mbox ? mbox->Hint : 0;
+                ui32 hint = 0;
+                size_t got = Table.AllocateBatch(&hint, 1);
+                return got > 0 ? hint : 0;
             }
         };
 
@@ -31,9 +24,9 @@ namespace NActors::NWorkStealing {
     Y_UNIT_TEST_SUITE(BucketMap) {
 
         Y_UNIT_TEST(DefaultBucketIsFast) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
             UNIT_ASSERT(hint > 0);
@@ -42,10 +35,10 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(InlineEvictionOnHighCost) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
 
@@ -60,10 +53,10 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(NoCheapEviction) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
 
@@ -73,19 +66,19 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(PredictFromClassCost) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             UNIT_ASSERT_EQUAL(bm.PredictFromClassCost(50000), 0u);   // fast
             UNIT_ASSERT_EQUAL(bm.PredictFromClassCost(200000), 1u);  // heavy
         }
 
         Y_UNIT_TEST(SetBucketExplicit) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
 
@@ -97,10 +90,10 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(ResetBucketOnReclaim) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
 
@@ -116,9 +109,9 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(InitialBoundaryIsZero) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             bm.SetActiveCount(8);
 
@@ -127,11 +120,11 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(DemandDrivenBoundary) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.MinActiveForBucketing = 4;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
             bm.SetActiveCount(16);
 
             // Create 3 heavy actors
@@ -148,11 +141,11 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(BucketingDisabledBelowMinActive) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.MinActiveForBucketing = 4;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
             bm.SetActiveCount(3); // below minimum
 
             ui32 hint = t.AllocateHint();
@@ -166,11 +159,11 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(BoundaryScalesWithActiveCount) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.MinActiveForBucketing = 4;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
             bm.SetActiveCount(16);
 
             // Create 4 heavy actors
@@ -192,11 +185,11 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(GenerationIncrements) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.MinActiveForBucketing = 2;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
             bm.SetActiveCount(8);
 
             uint32_t gen0 = bm.GetGeneration();
@@ -240,12 +233,12 @@ namespace NActors::NWorkStealing {
         }
 
         Y_UNIT_TEST(ReclassifyDowngrade) {
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.DowngradeThresholdCycles = 50000;
             config.MinSamplesForClassification = 16;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
 
             ui32 hint = t.AllocateHint();
 
@@ -255,7 +248,7 @@ namespace NActors::NWorkStealing {
 
             // Need enough events to satisfy MinSamples check in Reclassify.
             // Bump EventsProcessed via the stats counter.
-            if (auto* stats = t.Table->GetStats(hint)) {
+            if (auto* stats = t.Table.GetStats(hint)) {
                 stats->EventsProcessed.store(100, std::memory_order_relaxed);
             }
 
@@ -279,11 +272,11 @@ namespace NActors::NWorkStealing {
                 UNIT_ASSERT(slot.TryTransition(ESlotState::Initializing, ESlotState::Active));
             }
 
-            TTestMailboxTable t;
+            TTestWsMailboxTable t;
             TBucketConfig config;
             config.CostThresholdCycles = 100000;
             config.MinActiveForBucketing = 2;
-            TBucketMap bm(t.Table.get(), config);
+            TBucketMap bm(&t.Table, config);
             bm.SetActiveCount(N);
 
             // Create 3 heavy actors to set boundary=3

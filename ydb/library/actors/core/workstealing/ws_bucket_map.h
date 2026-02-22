@@ -1,6 +1,6 @@
 #pragma once
 
-#include <ydb/library/actors/core/mailbox_lockfree.h>
+#include "ws_mailbox_table.h"
 
 #include <atomic>
 #include <cstdint>
@@ -81,7 +81,7 @@ namespace NActors::NWorkStealing {
     //   C) Reclassify — periodic EMA-based sweep + demand-driven boundary
     class TBucketMap {
     public:
-        TBucketMap(TMailboxTable* mboxTable, const TBucketConfig& config);
+        TBucketMap(TWsMailboxTable* mboxTable, const TBucketConfig& config);
         ~TBucketMap();
 
         // Current bucket for a mailbox (fast path, relaxed load)
@@ -122,10 +122,10 @@ namespace NActors::NWorkStealing {
         uint32_t GetGeneration() const;
 
     private:
-        // Lazily-allocated parallel array of bucket info, same structure as
-        // TMailboxTable's Lines/StatLines but owned entirely by TBucketMap.
+        // Lazily-allocated parallel array of bucket info, same segment
+        // structure as TWsMailboxTable but owned entirely by TBucketMap.
         struct alignas(64) TBucketLine {
-            TMailboxBucketInfo Infos[TMailboxTable::MailboxesPerLine];
+            TMailboxBucketInfo Infos[TWsMailboxTable::MailboxesPerLine];
         };
 
         TMailboxBucketInfo* GetBucketInfo(ui32 hint);
@@ -135,7 +135,7 @@ namespace NActors::NWorkStealing {
         void RecalcBoundary();
 
     private:
-        TMailboxTable* MailboxTable_;
+        TWsMailboxTable* MailboxTable_;
         TBucketConfig Config_;
         std::atomic<ui16> BucketBoundary_{0}; // 0 = no partitioning (all fast)
         std::atomic<ui16> ActiveCount_{0};

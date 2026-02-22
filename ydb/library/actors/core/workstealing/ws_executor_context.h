@@ -9,6 +9,8 @@ namespace NActors {
 namespace NActors::NWorkStealing {
 
     class TBucketMap;
+    class TWsMailboxTable;
+    class TWsSlotAllocator;
 
     // TWSExecutorContext inherits TExecutorThread but is never started as a thread.
     //
@@ -56,11 +58,15 @@ namespace NActors::NWorkStealing {
         void FinishMailbox(TMailbox* mailbox);
 
         void SetBucketMap(TBucketMap* bucketMap) { BucketMap_ = bucketMap; }
+        void SetWsMailboxTable(TWsMailboxTable* table) { WsMailboxTable_ = table; }
+        void SetSlotAllocator(TWsSlotAllocator* alloc) { SlotAllocator_ = alloc; }
 
         // Do NOT start the thread.
         // TThread::Start() is never called.
     private:
         TBucketMap* BucketMap_ = nullptr;
+        TWsMailboxTable* WsMailboxTable_ = nullptr;
+        TWsSlotAllocator* SlotAllocator_ = nullptr;
     };
 
 } // namespace NActors::NWorkStealing

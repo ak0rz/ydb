@@ -1,5 +1,6 @@
 #include "ws_executor_context.h"
 #include "ws_bucket_map.h"
+#include "ws_mailbox_table.h"
 
 #include <ydb/library/actors/core/actor.h>
 #include <ydb/library/actors/core/actorsystem.h>
@@ -73,7 +74,10 @@ namespace NActors::NWorkStealing {
                 cs->ExecutionCycles.fetch_add(hpnow - hpprev, std::memory_order_relaxed);
             }
 
-            if (auto* mboxStats = ThreadCtx.WorkerContext.MailboxTable->GetStats(mailbox->Hint)) {
+            TMailboxExecStats* mboxStats = WsMailboxTable_
+                ? WsMailboxTable_->GetStats(mailbox->Hint)
+                : nullptr;
+            if (mboxStats) {
                 NHPTimer::STime eventCycles = hpnow - hpprev;
 
                 // Mailbox idle time: from last execution end to start of this event
@@ -154,7 +158,11 @@ namespace NActors::NWorkStealing {
             if (BucketMap_) {
                 BucketMap_->ResetBucket(mailbox->Hint);
             }
-            ThreadCtx.FreeMailbox(mailbox);
+            if (SlotAllocator_) {
+                SlotAllocator_->Free(mailbox->Hint);
+            } else {
+                ThreadCtx.FreeMailbox(mailbox);
+            }
         } else if (!mailbox->IsFree()) {
             mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);
         }

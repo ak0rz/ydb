@@ -11,9 +11,9 @@
 #include <cstdint>
 #include <optional>
 
-namespace NActors { class TMailboxTable; }
-
 namespace NActors::NWorkStealing {
+
+    class TWsMailboxTable;
 
     enum class ESlotState: uint8_t {
         Inactive,     // slot is idle, not assigned to a worker
@@ -77,7 +77,7 @@ namespace NActors::NWorkStealing {
         std::atomic<bool> Executing{false};   // true while inside executeCallback
         std::atomic<uint8_t> ContinuationCount{0};  // ring occupancy, read by router
         void* DriverData = nullptr;
-        NActors::TMailboxTable* MailboxTable = nullptr;  // set by pool init, used for cost-aware stealing
+        TWsMailboxTable* WsMailboxTable = nullptr;  // set by pool init (WS pools), used for cost-aware stealing
         uint32_t AssignedCpu = 0;  // CPU id assigned by topology ordering (set by driver)
 
         // --- Stats ---

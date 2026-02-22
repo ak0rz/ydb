@@ -209,6 +209,7 @@ namespace NActors {
 
         // Work-stealing: 1-based index of the last slot that executed this mailbox.
         // 0 means fresh/unassigned. Written by slot after execution (relaxed store).
+        // Fits in padding between ActorPack (1 byte) and TActorsInfo (8-byte aligned).
         ui16 LastPoolSlotIdx = 0;
 
         static constexpr TMailboxType::EType Type = TMailboxType::LockFreeIntrusive;
@@ -231,25 +232,6 @@ namespace NActors {
 
     static_assert(sizeof(TMailbox) <= 64, "TMailbox is too large");
 
-    // Per-mailbox execution/idle statistics, stored in a separate parallel
-    // array in TMailboxTable so that TMailbox stays at 64 bytes.
-    // Single-writer (mailbox locked during execution), but monitoring may
-    // read from another thread, so all counters use relaxed atomics.
-    struct alignas(64) TMailboxExecStats {
-        std::atomic<ui64> EventsProcessed{0};
-        std::atomic<ui64> TotalExecutionCycles{0};
-        std::atomic<ui64> MaxExecutionCycles{0};
-        std::atomic<ui64> ActivationCount{0};
-        std::atomic<ui64> LastExecutionEndCycles{0};
-        std::atomic<ui64> TotalIdleCycles{0};
-        std::atomic<ui64> MaxIdleCycles{0};
-        std::atomic<ui64> MinIdleCycles{Max<ui64>()};
-
-        void Reset() noexcept;
-    };
-
-    static_assert(sizeof(TMailboxExecStats) == 64, "TMailboxExecStats must be one cache line");
-
     class TMailboxTable {
     public:
         static constexpr size_t LinesCount = 0x1FFE0u;
@@ -261,16 +243,12 @@ namespace NActors {
         static constexpr ui32 MailboxIndexMask = 0xFFFu;
 
     public:
-        explicit TMailboxTable(size_t slabSize = 0);
+        TMailboxTable();
         ~TMailboxTable();
-
-        static TMailboxTable* Create();
-        static void Destroy(TMailboxTable* table) noexcept;
 
         bool Cleanup() noexcept;
 
         TMailbox* Get(ui32 hint) const;
-        TMailboxExecStats* GetStats(ui32 hint) const;
         TMailbox* Allocate();
         std::pair<TMailbox*, size_t> AllocateBlock();
         void Free(TMailbox*);
@@ -286,22 +264,9 @@ namespace NActors {
         void FreeFullBlock(TMailbox*) noexcept;
         TMailbox* AllocateFullBlockLocked();
 
-        void* SlabAllocate(size_t size, size_t alignment);
-        void* AllocateNewSlab();
-        static size_t DetectHugePageSize();
-
     private:
-        struct alignas(4096) TMailboxLine {
+        struct TMailboxLine {
             TMailbox Mailboxes[MailboxesPerLine];
-        };
-
-        struct alignas(4096) TMailboxStatLine {
-            TMailboxExecStats Stats[MailboxesPerLine];
-        };
-
-        struct TSlabHeader {
-            void* Next;
-            size_t Size;
         };
 
     private:
@@ -316,19 +281,9 @@ namespace NActors {
 
         // A large array of mailbox lines so we don't need extra pointer chasing
         std::atomic<TMailboxLine*> Lines[LinesCount] = { { nullptr } };
-
-        // Parallel array of per-mailbox execution/idle stats (allocated alongside Lines)
-        std::atomic<TMailboxStatLine*> StatLines[LinesCount] = { { nullptr } };
-
-        // Slab allocator for hugepage support
-        size_t SlabSize_{0};
-        void* NextSlab_{nullptr};
-        char* SlabCursor_{nullptr};
-        size_t SlabRemaining_{0};
-        size_t FirstHeapLineIndex_{Max<size_t>()};
     };
 
-    static_assert(sizeof(TMailboxTable) <= 2097152, "TMailboxTable is too large");
+    static_assert(sizeof(TMailboxTable) <= 1048576, "TMailboxTable is too large");
 
     class TMailboxCache {
     public:
