@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <random>
@@ -694,9 +695,106 @@ namespace {
     // Benchmark runners
     // -------------------------------------------------------------------
 
+    // -------------------------------------------------------------------
+    // Multi-pool setup
+    // -------------------------------------------------------------------
+
+    struct TMultiPoolParams {
+        i16 SystemSlots = 64;   // Pool 1
+        i16 UserSlots = 192;    // Pool 2
+        i16 BatchSlots = 64;    // Pool 3
+        i16 ICSlots = 64;       // Pool 4
+        bool Adaptive = true;
+        ui64 SpinThresholdCycles = 0;
+    };
+
+    THolder<NActors::TActorSystemSetup> MakeMultiBasicSetup(const TMultiPoolParams& mp) {
+        auto setup = MakeHolder<NActors::TActorSystemSetup>();
+        setup->NodeId = 1;
+
+        auto makePool = [](ui32 poolId, const TString& name, i16 threads) {
+            NActors::TBasicExecutorPoolConfig cfg;
+            cfg.PoolId = poolId;
+            cfg.PoolName = name;
+            cfg.Threads = threads;
+            cfg.MinThreadCount = threads;
+            cfg.MaxThreadCount = threads;
+            cfg.DefaultThreadCount = threads;
+            cfg.SpinThreshold = 1'000'000;
+            cfg.TimePerMailbox = TDuration::Hours(1);
+            return cfg;
+        };
+
+        setup->CpuManager.Basic.push_back(makePool(0, "scheduler", 1));
+        setup->CpuManager.Basic.push_back(makePool(1, "System", mp.SystemSlots));
+        setup->CpuManager.Basic.push_back(makePool(2, "User", mp.UserSlots));
+        setup->CpuManager.Basic.push_back(makePool(3, "Batch", mp.BatchSlots));
+        setup->CpuManager.Basic.push_back(makePool(4, "IC", mp.ICSlots));
+
+        setup->Scheduler.Reset(new NActors::TBasicSchedulerThread(NActors::TSchedulerConfig()));
+        return setup;
+    }
+
+    THolder<NActors::TActorSystemSetup> MakeMultiWSSetup(const TMultiPoolParams& mp) {
+        auto setup = MakeHolder<NActors::TActorSystemSetup>();
+        setup->NodeId = 1;
+
+        // Basic pool 0 (scheduler, 1 thread)
+        NActors::TBasicExecutorPoolConfig basicCfg;
+        basicCfg.PoolId = 0;
+        basicCfg.PoolName = "scheduler";
+        basicCfg.Threads = 1;
+        basicCfg.MinThreadCount = 1;
+        basicCfg.MaxThreadCount = 1;
+        basicCfg.DefaultThreadCount = 1;
+        setup->CpuManager.Basic.push_back(basicCfg);
+
+        // Helper to create a WS pool config
+        auto makePool = [&](ui32 poolId, const TString& name, i16 slots, i16 priority) {
+            NActors::TWorkStealingPoolConfig cfg;
+            cfg.PoolId = poolId;
+            cfg.PoolName = name;
+            cfg.MaxSlotCount = slots;
+            cfg.DefaultSlotCount = slots;
+            cfg.MinSlotCount = mp.Adaptive ? 1 : slots;
+            cfg.Priority = priority;
+            if (mp.SpinThresholdCycles > 0) {
+                cfg.WsConfig.SpinThresholdCycles = mp.SpinThresholdCycles;
+            }
+            if (GMinSpinThresholdCycles > 0) {
+                cfg.WsConfig.MinSpinThresholdCycles = GMinSpinThresholdCycles;
+            }
+            if (mp.Adaptive) {
+                cfg.WsConfig.AdaptiveScaling = true;
+            }
+            return cfg;
+        };
+
+        NActors::TWorkStealingConfig wsCfg;
+        wsCfg.Enabled = true;
+        wsCfg.Pools.push_back(makePool(1, "System", mp.SystemSlots, 30));
+        wsCfg.Pools.push_back(makePool(2, "User", mp.UserSlots, 20));
+        wsCfg.Pools.push_back(makePool(3, "Batch", mp.BatchSlots, 10));
+        wsCfg.Pools.push_back(makePool(4, "IC", mp.ICSlots, 40));
+        setup->CpuManager.WorkStealing = std::move(wsCfg);
+
+        setup->Scheduler.Reset(new NActors::TBasicSchedulerThread(NActors::TSchedulerConfig()));
+        return setup;
+    }
+
+    // -------------------------------------------------------------------
+    // Counter helpers (single-pool and multi-pool)
+    // -------------------------------------------------------------------
+
     void ResetWsCounters() {
         auto* pool = NActors::NWorkStealing::TWSExecutorPool::LastCreated;
         if (pool) {
+            pool->ResetCounters();
+        }
+    }
+
+    void ResetAllWsCounters() {
+        for (auto* pool : NActors::NWorkStealing::TWSExecutorPool::AllPools()) {
             pool->ResetCounters();
         }
     }
@@ -711,6 +809,19 @@ namespace {
                              pool->AdaptiveInflateEvents(),
                              pool->AdaptiveDeflateEvents());
             }
+        }
+    }
+
+    void DumpAllWsCounters() {
+        for (auto* pool : NActors::NWorkStealing::TWSExecutorPool::AllPools()) {
+            char label[128];
+            std::snprintf(label, sizeof(label), "pool/%s", pool->GetName().c_str());
+            pool->DumpCounters(label);
+            std::fprintf(stderr, "  [adaptive] active_slots=%u/%d inflate_events=%lu deflate_events=%lu\n",
+                         pool->GetThreads(),
+                         pool->GetMaxFullThreadCount(),
+                         pool->AdaptiveInflateEvents(),
+                         pool->AdaptiveDeflateEvents());
         }
     }
 
@@ -1121,13 +1232,177 @@ namespace {
     }
 
     // -------------------------------------------------------------------
-    // Topology-proof scenario: demonstrates that adaptive deflation
-    // follows topology ordering (SMT → L3 → NUMA).
-    //
-    // Creates a WS pool with many slots but few actors to force deflation.
-    // After convergence, reads each slot's assigned CPU and its topology
-    // attributes from sysfs, then prints a report showing that active
-    // slots cluster on nearby CPUs while farthest CPUs are deactivated.
+    // Multi-pool benchmark: runs different workloads simultaneously
+    // on 4 WS pools (System, User, Batch, IC) sharing one TThreadDriver.
+    // -------------------------------------------------------------------
+
+    void RunMultiPool(const TString& poolType, const TMultiPoolParams& mp,
+                       ui32 warmupSec, ui32 durationSec) {
+        bool isWs = (poolType == "ws");
+        std::fprintf(stderr, "\n=== Multi-Pool Benchmark (%s) ===\n", poolType.c_str());
+        std::fprintf(stderr, "Pools: System=%d User=%d Batch=%d IC=%d  adaptive=%s\n",
+                     mp.SystemSlots, mp.UserSlots, mp.BatchSlots, mp.ICSlots,
+                     (isWs && mp.Adaptive) ? "yes" : "no");
+
+        auto setup = isWs ? MakeMultiWSSetup(mp) : MakeMultiBasicSetup(mp);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        std::atomic<bool> stop{false};
+
+        // Per-pool counters
+        std::atomic<ui64> systemCounter{0};
+        std::atomic<ui64> userCounter{0};
+        std::atomic<ui64> batchCounter{0};
+        std::atomic<ui64> icCounter{0};
+
+        // --- Pool 1: System — chain(10) ---
+        {
+            ui32 pool = 1;
+            ui32 chainLen = 10;
+            std::vector<NActors::TActorId> ids;
+            std::vector<TChainActor*> actors;
+            for (ui32 i = 0; i < chainLen; ++i) {
+                auto* actor = new TChainActor(NActors::TActorId(), systemCounter, stop);
+                actors.push_back(actor);
+                ids.push_back(sys.Register(actor, NActors::TMailboxType::HTSwap, pool));
+            }
+            for (ui32 i = 0; i < chainLen; ++i) {
+                actors[i]->SetNext(ids[(i + 1) % chainLen]);
+            }
+            sys.Send(ids[0], new TEvBenchMsg());
+        }
+
+        // --- Pool 2: User — storage-node (8 VDisks, 32 clients) ---
+        {
+            ui32 pool = 2;
+            TStorageNodeParams sp;
+            sp.VDisks = 8;
+            sp.Clients = 32;
+
+            std::vector<NActors::TActorId> skeletonIds;
+            for (ui32 i = 0; i < sp.VDisks; ++i) {
+                auto* logger = new TLoggerActor(sp.LogWorkIters);
+                auto loggerId = sys.Register(logger, NActors::TMailboxType::HTSwap, pool);
+                auto* compaction = new TCompactionActor(sp.CompactionWorkIters);
+                auto compactionId = sys.Register(compaction, NActors::TMailboxType::HTSwap, pool);
+                auto* skeleton = new TVDiskSkeleton(
+                    loggerId, compactionId, userCounter, stop, sp, pool);
+                auto skeletonId = sys.Register(skeleton, NActors::TMailboxType::HTSwap, pool);
+                skeletonIds.push_back(skeletonId);
+                sys.Send(skeletonId, new TEvCompactionTick());
+            }
+            for (ui32 i = 0; i < sp.Clients; ++i) {
+                auto* client = new TStorageClient(
+                    skeletonIds, userCounter, stop, sp.PutRatio, 42 + i);
+                auto clientId = sys.Register(client, NActors::TMailboxType::HTSwap, pool);
+                sys.Send(clientId, new TEvBenchMsg());
+            }
+        }
+
+        // --- Pool 3: Batch — chain(5), sporadic ---
+        {
+            ui32 pool = 3;
+            ui32 chainLen = 5;
+            std::vector<NActors::TActorId> ids;
+            std::vector<TChainActor*> actors;
+            for (ui32 i = 0; i < chainLen; ++i) {
+                auto* actor = new TChainActor(NActors::TActorId(), batchCounter, stop);
+                actors.push_back(actor);
+                ids.push_back(sys.Register(actor, NActors::TMailboxType::HTSwap, pool));
+            }
+            for (ui32 i = 0; i < chainLen; ++i) {
+                actors[i]->SetNext(ids[(i + 1) % chainLen]);
+            }
+            sys.Send(ids[0], new TEvBenchMsg());
+        }
+
+        // --- Pool 4: IC — ping-pong (8 pairs) ---
+        {
+            ui32 pool = 4;
+            ui32 pairCount = 8;
+            for (ui32 i = 0; i < pairCount; ++i) {
+                auto* pong = new TPongActor(icCounter, stop);
+                auto pongId = sys.Register(pong, NActors::TMailboxType::HTSwap, pool);
+                auto* ping = new TPingActor(pongId, icCounter, stop);
+                auto pingId = sys.Register(ping, NActors::TMailboxType::HTSwap, pool);
+                pong->SetPeer(pingId);
+                sys.Send(pingId, new TEvBenchPing());
+            }
+        }
+
+        // Warmup
+        std::fprintf(stderr, "Warming up %u seconds...\n", warmupSec);
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+        systemCounter.store(0, std::memory_order_relaxed);
+        userCounter.store(0, std::memory_order_relaxed);
+        batchCounter.store(0, std::memory_order_relaxed);
+        icCounter.store(0, std::memory_order_relaxed);
+        if (isWs) {
+            ResetAllWsCounters();
+        }
+
+        // Measure
+        double cpuBefore = GetProcessCpuSeconds();
+        auto start = TClock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(durationSec));
+        auto end = TClock::now();
+        double cpuAfter = GetProcessCpuSeconds();
+
+        stop.store(true, std::memory_order_relaxed);
+        double elapsed = std::chrono::duration<double>(end - start).count();
+        double cpuSeconds = cpuAfter - cpuBefore;
+
+        // Report per-pool results
+        struct PoolResult {
+            const char* name;
+            const char* workload;
+            i16 slots;
+            std::atomic<ui64>& counter;
+        };
+        PoolResult pools[] = {
+            {"System", "chain(10)", mp.SystemSlots, systemCounter},
+            {"User", "storage-node", mp.UserSlots, userCounter},
+            {"Batch", "chain(5)", mp.BatchSlots, batchCounter},
+            {"IC", "ping-pong(8)", mp.ICSlots, icCounter},
+        };
+
+        // CSV header
+        std::printf("pool_type,scenario,pool_name,workload,slots,active_slots,ops_per_sec,cpu_seconds\n");
+        i16 totalActive = 0;
+        i16 totalMax = mp.SystemSlots + mp.UserSlots + mp.BatchSlots + mp.ICSlots;
+        for (auto& pr : pools) {
+            ui64 ops = pr.counter.load(std::memory_order_relaxed);
+            double opsPerSec = (elapsed > 0) ? (double)ops / elapsed : 0;
+            i16 activeSlots = pr.slots; // basic: all threads always active
+            if (isWs) {
+                auto* wsPool = NActors::NWorkStealing::TWSExecutorPool::FindPool(pr.name);
+                if (wsPool) {
+                    activeSlots = wsPool->GetFullThreadCount();
+                }
+            }
+            totalActive += activeSlots;
+            std::printf("%s,multi-pool,%s,%s,%d,%d,%.0f,%.2f\n",
+                        poolType.c_str(), pr.name, pr.workload, pr.slots,
+                        activeSlots, opsPerSec, cpuSeconds);
+        }
+        std::fflush(stdout);
+
+        // Stderr: per-pool WS counters + adaptive stats
+        if (isWs) {
+            DumpAllWsCounters();
+        }
+
+        std::fprintf(stderr, "\nAggregate: %d/%d active slots, %.2f CPU-seconds, %.1f%% utilization\n",
+                     totalActive, totalMax, cpuSeconds,
+                     (elapsed > 0 && totalMax > 0) ? (cpuSeconds / (elapsed * totalMax) * 100.0) : 0.0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sys.Stop();
+    }
+
+    // -------------------------------------------------------------------
+    // CPU topology info (shared by topology-proof and multi-pool-topology)
     // -------------------------------------------------------------------
 
     struct TCpuTopologyInfo {
@@ -1164,17 +1439,8 @@ namespace {
             info.CoreId = ReadSysfsInt(base + "/topology/core_id");
             info.PhysicalPackageId = ReadSysfsInt(base + "/topology/physical_package_id");
 
-            // Find NUMA node
+            // Find NUMA node via symlink
             info.NumaNode = -1;
-            for (int n = 0; n < 16; ++n) {
-                TString numaPath = TString("/sys/devices/system/node/node")
-                    + std::to_string(n).c_str() + "/cpulist";
-                std::ifstream nf(numaPath.c_str());
-                if (!nf.is_open()) break;
-                // Simple check: read the cpulist and see if our cpu is in range
-                // More reliable: check /sys/devices/system/cpu/cpuN/node<N> symlink
-            }
-            // Use the node symlink approach
             for (int n = 0; n < 16; ++n) {
                 TString nodePath = base + "/node" + std::to_string(n).c_str();
                 struct stat st;
@@ -1198,6 +1464,172 @@ namespace {
             return info;
         }
     };
+
+    // -------------------------------------------------------------------
+    // Multi-pool topology proof: creates 4 pools with many slots and
+    // few actors, waits for convergence, then reports per-pool topology.
+    // -------------------------------------------------------------------
+
+    void RunMultiPoolTopology(const TMultiPoolParams& mp, ui32 convergenceSec) {
+        std::fprintf(stderr, "\n=== Multi-Pool Topology Proof ===\n");
+        std::fprintf(stderr, "Pools: System=%d User=%d Batch=%d IC=%d  adaptive=forced\n",
+                     mp.SystemSlots, mp.UserSlots, mp.BatchSlots, mp.ICSlots);
+
+        // Force adaptive on for this scenario
+        TMultiPoolParams forced = mp;
+        forced.Adaptive = true;
+
+        auto setup = MakeMultiWSSetup(forced);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        std::atomic<bool> stop{false};
+
+        // Minimal actors per pool to force heavy deflation
+        // System: chain(3), User: chain(5), Batch: chain(2), IC: chain(3)
+        struct PoolWork {
+            ui32 poolId;
+            ui32 chainLen;
+            std::atomic<ui64> counter{0};
+        };
+        PoolWork work[] = {{1, 3, {}}, {2, 5, {}}, {3, 2, {}}, {4, 3, {}}};
+
+        for (auto& pw : work) {
+            std::vector<NActors::TActorId> ids;
+            std::vector<TChainActor*> actors;
+            for (ui32 i = 0; i < pw.chainLen; ++i) {
+                auto* actor = new TChainActor(NActors::TActorId(), pw.counter, stop);
+                actors.push_back(actor);
+                ids.push_back(sys.Register(actor, NActors::TMailboxType::HTSwap, pw.poolId));
+            }
+            for (ui32 i = 0; i < pw.chainLen; ++i) {
+                actors[i]->SetNext(ids[(i + 1) % pw.chainLen]);
+            }
+            sys.Send(ids[0], new TEvBenchMsg());
+        }
+
+        std::fprintf(stderr, "Waiting %u seconds for adaptive scaler convergence...\n", convergenceSec);
+        std::this_thread::sleep_for(std::chrono::seconds(convergenceSec));
+
+        // --- Per-pool topology report ---
+        const char* poolNames[] = {"System", "User", "Batch", "IC"};
+
+        i16 totalActiveAll = 0;
+        i16 totalMaxAll = 0;
+        std::set<uint32_t> allActiveCpus;
+
+        for (int pi = 0; pi < 4; ++pi) {
+            auto* wsPool = NActors::NWorkStealing::TWSExecutorPool::FindPool(poolNames[pi]);
+            if (!wsPool) {
+                std::fprintf(stderr, "ERROR: pool '%s' not found\n", poolNames[pi]);
+                continue;
+            }
+
+            i16 activeCount = wsPool->GetFullThreadCount();
+            i16 totalSlots = wsPool->GetMaxFullThreadCount();
+            auto* slots = wsPool->GetSlots();
+
+            totalActiveAll += activeCount;
+            totalMaxAll += totalSlots;
+
+            std::fprintf(stderr, "\n--- Pool '%s': %d active / %d total ---\n",
+                         poolNames[pi], activeCount, totalSlots);
+            std::fprintf(stderr, "%-6s %-6s %-7s %-6s %-30s\n",
+                         "Slot", "CPU", "Socket", "NUMA", "L3 shared_cpu_list");
+
+            struct TGroupStats { int Active = 0; int Inactive = 0; };
+            std::map<int, TGroupStats> numaStats;
+            std::map<TString, TGroupStats> l3Stats;
+
+            for (i16 i = 0; i < totalSlots; ++i) {
+                auto info = TCpuTopologyInfo::ForCpu(slots[i].AssignedCpu);
+                bool active = i < activeCount;
+                if (active) {
+                    allActiveCpus.insert(slots[i].AssignedCpu);
+                }
+                if (active) {
+                    numaStats[info.NumaNode].Active++;
+                    l3Stats[info.L3Index].Active++;
+                } else {
+                    numaStats[info.NumaNode].Inactive++;
+                    l3Stats[info.L3Index].Inactive++;
+                }
+
+                // Print active slots and a sample of inactive
+                if (active || i < activeCount + 3 || i >= totalSlots - 2) {
+                    std::fprintf(stderr, "%-6d %-6u %-7d %-6d %s%s\n",
+                                 i, slots[i].AssignedCpu, info.PhysicalPackageId,
+                                 info.NumaNode, info.L3Index.c_str(),
+                                 active ? "" : "  (inactive)");
+                } else if (i == activeCount + 3) {
+                    std::fprintf(stderr, "  ... (%d inactive slots omitted) ...\n",
+                                 totalSlots - activeCount - 5);
+                }
+            }
+
+            // NUMA spread
+            int numaWithActive = 0;
+            for (auto& [n, s] : numaStats) {
+                if (s.Active > 0) numaWithActive++;
+            }
+            int l3WithActive = 0;
+            for (auto& [l, s] : l3Stats) {
+                if (s.Active > 0) l3WithActive++;
+            }
+            std::fprintf(stderr, "  NUMA spread: %d/%d nodes   L3 spread: %d/%d groups\n",
+                         numaWithActive, (int)numaStats.size(),
+                         l3WithActive, (int)l3Stats.size());
+            std::fprintf(stderr, "  Inflate events: %lu  Deflate events: %lu\n",
+                         wsPool->AdaptiveInflateEvents(), wsPool->AdaptiveDeflateEvents());
+        }
+
+        // --- Combined footprint ---
+        std::fprintf(stderr, "\n=== COMBINED FOOTPRINT ===\n");
+        std::fprintf(stderr, "Total active slots: %d / %d  (%.0f%% reduction)\n",
+                     totalActiveAll, totalMaxAll,
+                     totalMaxAll > 0 ? (1.0 - (double)totalActiveAll / totalMaxAll) * 100 : 0.0);
+        std::fprintf(stderr, "Unique active CPUs: %d\n", (int)allActiveCpus.size());
+
+        if (!allActiveCpus.empty()) {
+            uint32_t minCpu = *allActiveCpus.begin();
+            uint32_t maxCpu = *allActiveCpus.rbegin();
+            std::fprintf(stderr, "CPU range: %u..%u (span %u, density %.0f%%)\n",
+                         minCpu, maxCpu, maxCpu - minCpu + 1,
+                         (double)allActiveCpus.size() / (maxCpu - minCpu + 1) * 100);
+        }
+
+        // --- Verification checks ---
+        std::fprintf(stderr, "\n=== VERIFICATION ===\n");
+
+        for (auto* pool : NActors::NWorkStealing::TWSExecutorPool::AllPools()) {
+            if (pool->GetFullThreadCount() >= pool->GetMaxFullThreadCount()) {
+                std::fprintf(stderr, "FAIL: pool '%s' did not deflate (%d/%d)\n",
+                             pool->GetName().c_str(),
+                             pool->GetFullThreadCount(),
+                             pool->GetMaxFullThreadCount());
+            } else {
+                std::fprintf(stderr, "PASS: pool '%s' deflated %d → %d slots\n",
+                             pool->GetName().c_str(),
+                             pool->GetMaxFullThreadCount(),
+                             pool->GetFullThreadCount());
+            }
+        }
+
+        if ((int)allActiveCpus.size() < totalMaxAll) {
+            std::fprintf(stderr, "PASS: combined active CPUs (%d) << total slots (%d)\n",
+                         (int)allActiveCpus.size(), totalMaxAll);
+        } else {
+            std::fprintf(stderr, "FAIL: no CPU reduction\n");
+        }
+
+        stop.store(true, std::memory_order_relaxed);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sys.Stop();
+    }
+
+    // -------------------------------------------------------------------
+    // Single-pool topology proof (original scenario)
+    // -------------------------------------------------------------------
 
     void RunTopologyProof(ui32 threads, ui32 actors, ui32 warmupSec) {
         std::fprintf(stderr, "\n=== Topology Proof: %u threads, %u actors, adaptive scaling ===\n\n", threads, actors);
@@ -1422,7 +1854,8 @@ int main(int argc, const char* argv[]) {
         .StoreResult(&poolType);
 
     TString scenario = "all";
-    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, storage-node, topology-proof, or all")
+    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, "
+        "storage-node, topology-proof, multi-pool, multi-pool-topology, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -1513,6 +1946,27 @@ int main(int argc, const char* argv[]) {
         .DefaultValue("100")
         .StoreResult(&stageWorkIters);
 
+    // Multi-pool scenario parameters
+    i16 systemSlots = 64;
+    opts.AddLongOption("system-slots", "System pool slots (multi-pool scenarios)")
+        .DefaultValue("64")
+        .StoreResult(&systemSlots);
+
+    i16 userSlots = 192;
+    opts.AddLongOption("user-slots", "User pool slots (multi-pool scenarios)")
+        .DefaultValue("192")
+        .StoreResult(&userSlots);
+
+    i16 batchSlots = 64;
+    opts.AddLongOption("batch-slots", "Batch pool slots (multi-pool scenarios)")
+        .DefaultValue("64")
+        .StoreResult(&batchSlots);
+
+    i16 icSlots = 64;
+    opts.AddLongOption("ic-slots", "IC pool slots (multi-pool scenarios)")
+        .DefaultValue("64")
+        .StoreResult(&icSlots);
+
     NLastGetopt::TOptsParseResult res(&opts, argc, argv);
 
     GSpinThresholdCycles = spinThreshold;
@@ -1539,6 +1993,14 @@ int main(int argc, const char* argv[]) {
     storageParams.CompactionWorkIters = compactionWorkIters;
     storageParams.CompactionPeriodMs = compactionPeriodMs;
 
+    TMultiPoolParams multiPoolParams;
+    multiPoolParams.SystemSlots = systemSlots;
+    multiPoolParams.UserSlots = userSlots;
+    multiPoolParams.BatchSlots = batchSlots;
+    multiPoolParams.ICSlots = icSlots;
+    multiPoolParams.Adaptive = adaptive;
+    multiPoolParams.SpinThresholdCycles = spinThreshold;
+
     std::vector<TString> scenarios;
     if (scenario == "all") {
         scenarios = {"ping-pong", "star", "chain", "reincarnation", "pipeline", "storage-node"};
@@ -1549,13 +2011,25 @@ int main(int argc, const char* argv[]) {
     // CSV header
     std::printf("pool_type,scenario,threads,actor_pairs,ops_per_sec,avg_latency_us,cpu_seconds,cpu_util_pct\n");
 
-    // Topology-proof is a special scenario that runs once and exits
+    // Special scenarios that run once and exit
     if (scenario == "topology-proof") {
         if (threads.empty()) {
             threads = {384};
         }
         ui32 topologyActors = pairs.empty() ? 10 : pairs[0];
         RunTopologyProof(threads[0], topologyActors, warmupSec + durationSec);
+        return 0;
+    }
+
+    if (scenario == "multi-pool") {
+        for (const auto& pt : poolTypes) {
+            RunMultiPool(pt, multiPoolParams, warmupSec, durationSec);
+        }
+        return 0;
+    }
+
+    if (scenario == "multi-pool-topology") {
+        RunMultiPoolTopology(multiPoolParams, warmupSec + durationSec);
         return 0;
     }
 

@@ -90,7 +90,12 @@ namespace NActors::NWorkStealing {
         uint64_t AdaptiveInflateEvents() const;
         uint64_t AdaptiveDeflateEvents() const;
 
-        // Debug: last created pool instance (for benchmark introspection).
+        // Pool registry — all live TWSExecutorPool instances.
+        static TVector<TWSExecutorPool*>& AllPools();
+        static TWSExecutorPool* FindPool(const TString& name);
+
+        // Debug: last created pool instance (for backward compat with
+        // single-pool benchmark functions).
         static TWSExecutorPool* LastCreated;
 
     private:

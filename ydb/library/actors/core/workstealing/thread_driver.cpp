@@ -347,7 +347,7 @@ namespace NActors::NWorkStealing {
                 worker.Slot->Stats.IdleCycles.fetch_add(pollElapsed, std::memory_order_relaxed);
             }
 
-            if (worker.WorkerIndex == 0 && worker.Callbacks.AdaptiveEval) {
+            if (worker.Callbacks.AdaptiveEval) {
                 ui64 now = GetCycleCountFast();
                 if (now - lastAdaptiveEvalTs > Config_.AdaptiveEvalCycles) {
                     lastAdaptiveEvalTs = now;

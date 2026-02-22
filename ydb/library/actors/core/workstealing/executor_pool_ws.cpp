@@ -4,6 +4,8 @@
 #include <ydb/library/actors/core/mailbox_lockfree.h>
 #include <ydb/library/actors/util/datetime.h>
 
+#include <algorithm>
+
 
 namespace NActors::NWorkStealing {
 
@@ -23,6 +25,20 @@ namespace NActors::NWorkStealing {
 
     TWSExecutorPool* TWSExecutorPool::LastCreated = nullptr;
 
+    TVector<TWSExecutorPool*>& TWSExecutorPool::AllPools() {
+        static TVector<TWSExecutorPool*> pools;
+        return pools;
+    }
+
+    TWSExecutorPool* TWSExecutorPool::FindPool(const TString& name) {
+        for (auto* p : AllPools()) {
+            if (p->GetName() == name) {
+                return p;
+            }
+        }
+        return nullptr;
+    }
+
     TWSExecutorPool::TWSExecutorPool(const TWSExecutorPoolConfig& cfg)
         : TExecutorPoolBaseMailboxed(cfg.PoolId)
         , WsConfig_(cfg.WsConfig)
@@ -37,12 +53,15 @@ namespace NActors::NWorkStealing {
         , Priority_(cfg.Priority)
     {
         LastCreated = this;
+        AllPools().push_back(this);
     }
 
     TWSExecutorPool::~TWSExecutorPool() {
         if (LastCreated == this) {
             LastCreated = nullptr;
         }
+        auto& pools = AllPools();
+        pools.erase(std::remove(pools.begin(), pools.end(), this), pools.end());
     }
 
     void TWSExecutorPool::SetDriver(IDriver* driver) {
