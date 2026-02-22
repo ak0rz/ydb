@@ -18,6 +18,16 @@ namespace NActors::NWorkStealing {
         uint64_t TimePerMailboxNs = 1000000;  // 1ms -- max time per mailbox execution
         uint32_t ParkAfterIdlePolls = 64;     // park after this many consecutive idle PollSlot calls
         uint8_t ContinuationRingCapacity = 4;  // max items in continuation ring (1-8)
+
+        // Adaptive slot scaling
+        bool AdaptiveScaling = false;               // master switch
+        uint64_t AdaptiveEvalCycles = 30000000;     // ~10ms at 3GHz between evaluations
+        uint64_t AdaptiveCooldownCycles = 90000000; // ~30ms cooldown after scaling change
+        double InflateUtilThreshold = 0.8;          // inflate when >=80% of slots busy
+        double DeflateUtilThreshold = 0.3;          // deflate when <30% of slots busy
+        double SlotBusyThreshold = 0.1;             // slot considered "busy" above 10% util
+        uint32_t QueuePressureThreshold = 16;       // inflate if any slot queue depth >16
+        uint64_t AdaptiveParkNs = 50000;              // 50us — timed park for eval worker
     };
 
 } // namespace NActors::NWorkStealing

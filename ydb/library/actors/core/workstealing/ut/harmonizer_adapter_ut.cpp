@@ -21,8 +21,8 @@ namespace NActors::NWorkStealing {
 
         Y_UNIT_TEST(GetSlotCpuConsumptionWithLoad) {
             TSlot slots[1];
-            slots[0].Stats.BusyCycles = 500;
-            slots[0].Stats.IdleCycles = 500;
+            slots[0].Stats.BusyCycles.store(500, std::memory_order_relaxed);
+            slots[0].Stats.IdleCycles.store(500, std::memory_order_relaxed);
             THarmonizerAdapter adapter(slots, 1);
 
             auto c = adapter.GetSlotCpuConsumption(0);
@@ -35,7 +35,7 @@ namespace NActors::NWorkStealing {
 
         Y_UNIT_TEST(GetSlotCpuConsumptionOutOfRange) {
             TSlot slots[2];
-            slots[0].Stats.BusyCycles = 100;
+            slots[0].Stats.BusyCycles.store(100, std::memory_order_relaxed);
             THarmonizerAdapter adapter(slots, 2);
 
             // Negative index
@@ -52,18 +52,18 @@ namespace NActors::NWorkStealing {
         Y_UNIT_TEST(CollectPoolStats) {
             TSlot slots[3];
             slots[0].Stats.ActivationsExecuted = 10;
-            slots[0].Stats.BusyCycles = 100;
-            slots[0].Stats.IdleCycles = 200;
+            slots[0].Stats.BusyCycles.store(100, std::memory_order_relaxed);
+            slots[0].Stats.IdleCycles.store(200, std::memory_order_relaxed);
             slots[0].Stats.ExecTimeAccumNs = 1000;
 
             slots[1].Stats.ActivationsExecuted = 20;
-            slots[1].Stats.BusyCycles = 300;
-            slots[1].Stats.IdleCycles = 400;
+            slots[1].Stats.BusyCycles.store(300, std::memory_order_relaxed);
+            slots[1].Stats.IdleCycles.store(400, std::memory_order_relaxed);
             slots[1].Stats.ExecTimeAccumNs = 2000;
 
             slots[2].Stats.ActivationsExecuted = 50;
-            slots[2].Stats.BusyCycles = 999;
-            slots[2].Stats.IdleCycles = 999;
+            slots[2].Stats.BusyCycles.store(999, std::memory_order_relaxed);
+            slots[2].Stats.IdleCycles.store(999, std::memory_order_relaxed);
             slots[2].Stats.ExecTimeAccumNs = 9999;
 
             THarmonizerAdapter adapter(slots, 3);
@@ -73,21 +73,21 @@ namespace NActors::NWorkStealing {
             adapter.CollectPoolStats(agg, 2);
 
             UNIT_ASSERT_EQUAL(agg.ActivationsExecuted, 30u);
-            UNIT_ASSERT_EQUAL(agg.BusyCycles, 400u);
-            UNIT_ASSERT_EQUAL(agg.IdleCycles, 600u);
+            UNIT_ASSERT_EQUAL(agg.BusyCycles.load(std::memory_order_relaxed), 400u);
+            UNIT_ASSERT_EQUAL(agg.IdleCycles.load(std::memory_order_relaxed), 600u);
             UNIT_ASSERT_EQUAL(agg.ExecTimeAccumNs, 3000u);
         }
 
         Y_UNIT_TEST(CollectPoolStatsAllSlots) {
             TSlot slots[2];
             slots[0].Stats.ActivationsExecuted = 5;
-            slots[0].Stats.BusyCycles = 50;
-            slots[0].Stats.IdleCycles = 50;
+            slots[0].Stats.BusyCycles.store(50, std::memory_order_relaxed);
+            slots[0].Stats.IdleCycles.store(50, std::memory_order_relaxed);
             slots[0].Stats.ExecTimeAccumNs = 500;
 
             slots[1].Stats.ActivationsExecuted = 15;
-            slots[1].Stats.BusyCycles = 150;
-            slots[1].Stats.IdleCycles = 150;
+            slots[1].Stats.BusyCycles.store(150, std::memory_order_relaxed);
+            slots[1].Stats.IdleCycles.store(150, std::memory_order_relaxed);
             slots[1].Stats.ExecTimeAccumNs = 1500;
 
             THarmonizerAdapter adapter(slots, 2);
@@ -96,18 +96,18 @@ namespace NActors::NWorkStealing {
             adapter.CollectPoolStats(agg, 2);
 
             UNIT_ASSERT_EQUAL(agg.ActivationsExecuted, 20u);
-            UNIT_ASSERT_EQUAL(agg.BusyCycles, 200u);
-            UNIT_ASSERT_EQUAL(agg.IdleCycles, 200u);
+            UNIT_ASSERT_EQUAL(agg.BusyCycles.load(std::memory_order_relaxed), 200u);
+            UNIT_ASSERT_EQUAL(agg.IdleCycles.load(std::memory_order_relaxed), 200u);
             UNIT_ASSERT_EQUAL(agg.ExecTimeAccumNs, 2000u);
         }
 
         Y_UNIT_TEST(UpdateLoadEstimates) {
             TSlot slots[2];
-            slots[0].Stats.BusyCycles = 750;
-            slots[0].Stats.IdleCycles = 250;
+            slots[0].Stats.BusyCycles.store(750, std::memory_order_relaxed);
+            slots[0].Stats.IdleCycles.store(250, std::memory_order_relaxed);
 
-            slots[1].Stats.BusyCycles = 200;
-            slots[1].Stats.IdleCycles = 800;
+            slots[1].Stats.BusyCycles.store(200, std::memory_order_relaxed);
+            slots[1].Stats.IdleCycles.store(800, std::memory_order_relaxed);
 
             THarmonizerAdapter adapter(slots, 2);
             adapter.UpdateLoadEstimates(2);
@@ -122,8 +122,6 @@ namespace NActors::NWorkStealing {
         Y_UNIT_TEST(UpdateLoadEstimatesZeroCycles) {
             TSlot slots[1];
             // Both cycles zero — load should be 0.0
-            slots[0].Stats.BusyCycles = 0;
-            slots[0].Stats.IdleCycles = 0;
 
             THarmonizerAdapter adapter(slots, 1);
             adapter.UpdateLoadEstimates(1);
@@ -134,8 +132,7 @@ namespace NActors::NWorkStealing {
 
         Y_UNIT_TEST(UpdateLoadEstimatesFullLoad) {
             TSlot slots[1];
-            slots[0].Stats.BusyCycles = 1000;
-            slots[0].Stats.IdleCycles = 0;
+            slots[0].Stats.BusyCycles.store(1000, std::memory_order_relaxed);
 
             THarmonizerAdapter adapter(slots, 1);
             adapter.UpdateLoadEstimates(1);
@@ -146,13 +143,13 @@ namespace NActors::NWorkStealing {
 
         Y_UNIT_TEST(ResetCounters) {
             TSlot slots[2];
-            slots[0].Stats.BusyCycles = 100;
-            slots[0].Stats.IdleCycles = 200;
+            slots[0].Stats.BusyCycles.store(100, std::memory_order_relaxed);
+            slots[0].Stats.IdleCycles.store(200, std::memory_order_relaxed);
             slots[0].Stats.ActivationsExecuted = 50;
             slots[0].Stats.ExecTimeAccumNs = 999;
 
-            slots[1].Stats.BusyCycles = 300;
-            slots[1].Stats.IdleCycles = 400;
+            slots[1].Stats.BusyCycles.store(300, std::memory_order_relaxed);
+            slots[1].Stats.IdleCycles.store(400, std::memory_order_relaxed);
             slots[1].Stats.ActivationsExecuted = 70;
             slots[1].Stats.ExecTimeAccumNs = 777;
 
@@ -160,10 +157,10 @@ namespace NActors::NWorkStealing {
             adapter.ResetCounters(2);
 
             // BusyCycles and IdleCycles should be zeroed
-            UNIT_ASSERT_EQUAL(slots[0].Stats.BusyCycles, 0u);
-            UNIT_ASSERT_EQUAL(slots[0].Stats.IdleCycles, 0u);
-            UNIT_ASSERT_EQUAL(slots[1].Stats.BusyCycles, 0u);
-            UNIT_ASSERT_EQUAL(slots[1].Stats.IdleCycles, 0u);
+            UNIT_ASSERT_EQUAL(slots[0].Stats.BusyCycles.load(std::memory_order_relaxed), 0u);
+            UNIT_ASSERT_EQUAL(slots[0].Stats.IdleCycles.load(std::memory_order_relaxed), 0u);
+            UNIT_ASSERT_EQUAL(slots[1].Stats.BusyCycles.load(std::memory_order_relaxed), 0u);
+            UNIT_ASSERT_EQUAL(slots[1].Stats.IdleCycles.load(std::memory_order_relaxed), 0u);
 
             // ActivationsExecuted and ExecTimeAccumNs are not reset
             UNIT_ASSERT_EQUAL(slots[0].Stats.ActivationsExecuted, 50u);

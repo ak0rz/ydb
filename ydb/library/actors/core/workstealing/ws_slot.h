@@ -24,8 +24,8 @@ namespace NActors::NWorkStealing {
 
     struct TSlotStats {
         uint64_t ActivationsExecuted = 0;
-        uint64_t IdleCycles = 0;
-        uint64_t BusyCycles = 0;
+        std::atomic<uint64_t> IdleCycles{0};
+        std::atomic<uint64_t> BusyCycles{0};
         uint64_t ExecTimeAccumNs = 0;
     };
 
@@ -78,6 +78,7 @@ namespace NActors::NWorkStealing {
         std::atomic<uint8_t> ContinuationCount{0};  // ring occupancy, read by router
         void* DriverData = nullptr;
         NActors::TMailboxTable* MailboxTable = nullptr;  // set by pool init, used for cost-aware stealing
+        uint32_t AssignedCpu = 0;  // CPU id assigned by topology ordering (set by driver)
 
         // --- Stats ---
 

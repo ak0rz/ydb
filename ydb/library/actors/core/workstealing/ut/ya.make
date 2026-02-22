@@ -24,6 +24,7 @@ SRCS(
     mpmc_unbounded_queue_ut.cpp
     thread_driver_ut.cpp
     topology_ut.cpp
+    ws_adaptive_scaler_ut.cpp
     ws_executor_context_ut.cpp
     ws_poll_ut.cpp
     ws_slot_ut.cpp

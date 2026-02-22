@@ -15,6 +15,7 @@ namespace NActors::NWorkStealing {
         TOverflowCallback Overflow;     // Ring overflow → reroute activation to another slot
         std::function<void()> Setup;    // Called once at worker thread start (TLS setup)
         std::function<void()> Teardown; // Called once at worker thread end (TLS cleanup)
+        std::function<void()> AdaptiveEval; // Periodic eval from worker 0 (adaptive scaling)
     };
 
     // Abstract driver interface. Owns system-wide workers pinned to CPUs.

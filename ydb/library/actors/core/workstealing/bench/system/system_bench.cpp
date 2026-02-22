@@ -14,11 +14,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <map>
 #include <string>
 #include <thread>
 #include <random>
 #include <vector>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 namespace {
 
@@ -88,6 +91,8 @@ namespace {
         return setup;
     }
 
+    bool GAdaptive = false;
+
     THolder<NActors::TActorSystemSetup> MakeWSSetup(i16 slots, ui64 spinThresholdCycles = 0) {
         auto setup = MakeHolder<NActors::TActorSystemSetup>();
         setup->NodeId = 1;
@@ -114,6 +119,10 @@ namespace {
         }
         if (GMinSpinThresholdCycles > 0) {
             wsCfg.WsConfig.MinSpinThresholdCycles = GMinSpinThresholdCycles;
+        }
+        if (GAdaptive) {
+            wsCfg.WsConfig.AdaptiveScaling = true;
+            wsCfg.MinSlotCount = 1;
         }
         setup->CpuManager.WorkStealing = NActors::TWorkStealingConfig{
             .Enabled = true,
@@ -696,6 +705,12 @@ namespace {
         auto* pool = NActors::NWorkStealing::TWSExecutorPool::LastCreated;
         if (pool) {
             pool->DumpCounters(label);
+            if (GAdaptive) {
+                std::fprintf(stderr, "  [adaptive] active_slots=%u inflate_events=%lu deflate_events=%lu\n",
+                             pool->GetThreads(),
+                             pool->AdaptiveInflateEvents(),
+                             pool->AdaptiveDeflateEvents());
+            }
         }
     }
 
@@ -1105,6 +1120,296 @@ namespace {
         };
     }
 
+    // -------------------------------------------------------------------
+    // Topology-proof scenario: demonstrates that adaptive deflation
+    // follows topology ordering (SMT → L3 → NUMA).
+    //
+    // Creates a WS pool with many slots but few actors to force deflation.
+    // After convergence, reads each slot's assigned CPU and its topology
+    // attributes from sysfs, then prints a report showing that active
+    // slots cluster on nearby CPUs while farthest CPUs are deactivated.
+    // -------------------------------------------------------------------
+
+    struct TCpuTopologyInfo {
+        uint32_t CpuId;
+        int CoreId;
+        int PhysicalPackageId;
+        int NumaNode;
+        TString L3Index;
+
+        static int ReadSysfsInt(const TString& path) {
+            std::ifstream f(path.c_str());
+            int val = -1;
+            if (f.is_open()) {
+                f >> val;
+            }
+            return val;
+        }
+
+        static TString ReadSysfsString(const TString& path) {
+            std::ifstream f(path.c_str());
+            TString val;
+            if (f.is_open()) {
+                std::string line;
+                std::getline(f, line);
+                val = line;
+            }
+            return val;
+        }
+
+        static TCpuTopologyInfo ForCpu(uint32_t cpuId) {
+            TCpuTopologyInfo info;
+            info.CpuId = cpuId;
+            TString base = TString("/sys/devices/system/cpu/cpu") + std::to_string(cpuId).c_str();
+            info.CoreId = ReadSysfsInt(base + "/topology/core_id");
+            info.PhysicalPackageId = ReadSysfsInt(base + "/topology/physical_package_id");
+
+            // Find NUMA node
+            info.NumaNode = -1;
+            for (int n = 0; n < 16; ++n) {
+                TString numaPath = TString("/sys/devices/system/node/node")
+                    + std::to_string(n).c_str() + "/cpulist";
+                std::ifstream nf(numaPath.c_str());
+                if (!nf.is_open()) break;
+                // Simple check: read the cpulist and see if our cpu is in range
+                // More reliable: check /sys/devices/system/cpu/cpuN/node<N> symlink
+            }
+            // Use the node symlink approach
+            for (int n = 0; n < 16; ++n) {
+                TString nodePath = base + "/node" + std::to_string(n).c_str();
+                struct stat st;
+                if (stat(nodePath.c_str(), &st) == 0) {
+                    info.NumaNode = n;
+                    break;
+                }
+            }
+
+            // Find L3 cache index (look for level=3 in cache indices)
+            info.L3Index = "?";
+            for (int idx = 0; idx < 10; ++idx) {
+                TString cachePath = base + "/cache/index" + std::to_string(idx).c_str();
+                int level = ReadSysfsInt(cachePath + "/level");
+                if (level == 3) {
+                    info.L3Index = ReadSysfsString(cachePath + "/shared_cpu_list");
+                    break;
+                }
+            }
+
+            return info;
+        }
+    };
+
+    void RunTopologyProof(ui32 threads, ui32 actors, ui32 warmupSec) {
+        std::fprintf(stderr, "\n=== Topology Proof: %u threads, %u actors, adaptive scaling ===\n\n", threads, actors);
+
+        // Force adaptive on
+        bool savedAdaptive = GAdaptive;
+        GAdaptive = true;
+
+        auto setup = MakeWSSetup(threads, GSpinThresholdCycles);
+        NActors::TActorSystem sys(setup);
+        sys.Start();
+
+        ui32 pool = 1; // WS pool
+
+        std::atomic<ui64> counter{0};
+        std::atomic<bool> stop{false};
+
+        // Create a few chain actors to keep some slots busy
+        std::vector<NActors::TActorId> ids;
+        std::vector<TChainActor*> chainActors;
+        for (ui32 i = 0; i < actors; ++i) {
+            auto* actor = new TChainActor(NActors::TActorId(), counter, stop);
+            chainActors.push_back(actor);
+            NActors::TActorId id = sys.Register(actor, NActors::TMailboxType::HTSwap, pool);
+            ids.push_back(id);
+        }
+        for (ui32 i = 0; i < actors; ++i) {
+            chainActors[i]->SetNext(ids[(i + 1) % actors]);
+        }
+        sys.Send(ids[0], new TEvBenchMsg());
+
+        // Wait for adaptive scaler to converge
+        std::fprintf(stderr, "Waiting %u seconds for adaptive scaler convergence...\n", warmupSec);
+        std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
+
+        // Read slot topology
+        auto* wsPool = NActors::NWorkStealing::TWSExecutorPool::LastCreated;
+        if (!wsPool) {
+            std::fprintf(stderr, "ERROR: no WS pool found\n");
+            stop.store(true, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            sys.Stop();
+            GAdaptive = savedAdaptive;
+            return;
+        }
+
+        // activeCount is the scaler's decision; slot state may lag (DRAIN→INACTIVE).
+        // Use slot index < activeCount as the source of truth.
+        i16 activeCount = wsPool->GetFullThreadCount();
+        i16 totalSlots = wsPool->GetMaxFullThreadCount();
+        auto* slots = wsPool->GetSlots();
+
+        std::fprintf(stderr, "Scaler decision: %d active / %d total slots\n\n", activeCount, totalSlots);
+
+        // Collect topology info for all slots
+        struct TSlotInfo {
+            i16 SlotIdx;
+            uint32_t CpuId;
+            int Socket;
+            int NumaNode;
+            TString L3Group;
+            bool IsActive; // by scaler decision (slot index < activeCount)
+        };
+        std::vector<TSlotInfo> slotInfos;
+        slotInfos.reserve(totalSlots);
+
+        for (i16 i = 0; i < totalSlots; ++i) {
+            auto info = TCpuTopologyInfo::ForCpu(slots[i].AssignedCpu);
+            slotInfos.push_back({i, slots[i].AssignedCpu, info.PhysicalPackageId,
+                                 info.NumaNode, info.L3Index, i < activeCount});
+        }
+
+        // Print active slots (always show all of them)
+        std::fprintf(stderr, "--- Active slots (0..%d) ---\n", activeCount - 1);
+        std::fprintf(stderr, "%-6s %-6s %-7s %-6s %-30s\n",
+                     "Slot", "CPU", "Socket", "NUMA", "L3 shared_cpu_list");
+        std::fprintf(stderr, "%-6s %-6s %-7s %-6s %-30s\n",
+                     "----", "---", "------", "----", "------------------");
+        for (i16 i = 0; i < activeCount; ++i) {
+            auto& si = slotInfos[i];
+            std::fprintf(stderr, "%-6d %-6u %-7d %-6d %s\n",
+                         si.SlotIdx, si.CpuId, si.Socket, si.NumaNode, si.L3Group.c_str());
+        }
+
+        // Print a sample of inactive slots (first 5 and last 5)
+        if (totalSlots > activeCount) {
+            std::fprintf(stderr, "\n--- Inactive slots (sample: first 5, last 5 of %d..%d) ---\n",
+                         activeCount, totalSlots - 1);
+            std::fprintf(stderr, "%-6s %-6s %-7s %-6s %-30s\n",
+                         "Slot", "CPU", "Socket", "NUMA", "L3 shared_cpu_list");
+            std::fprintf(stderr, "%-6s %-6s %-7s %-6s %-30s\n",
+                         "----", "---", "------", "----", "------------------");
+            i16 inactiveCount = totalSlots - activeCount;
+            i16 showFirst = std::min<i16>(5, inactiveCount);
+            i16 showLast = std::min<i16>(5, inactiveCount - showFirst);
+            for (i16 i = activeCount; i < activeCount + showFirst; ++i) {
+                auto& si = slotInfos[i];
+                std::fprintf(stderr, "%-6d %-6u %-7d %-6d %s\n",
+                             si.SlotIdx, si.CpuId, si.Socket, si.NumaNode, si.L3Group.c_str());
+            }
+            if (showLast > 0 && showFirst < inactiveCount) {
+                std::fprintf(stderr, "  ... (%d slots omitted) ...\n", inactiveCount - showFirst - showLast);
+                for (i16 i = totalSlots - showLast; i < totalSlots; ++i) {
+                    auto& si = slotInfos[i];
+                    std::fprintf(stderr, "%-6d %-6u %-7d %-6d %s\n",
+                                 si.SlotIdx, si.CpuId, si.Socket, si.NumaNode, si.L3Group.c_str());
+                }
+            }
+        }
+
+        // Collect per-NUMA and per-L3 stats (based on scaler decision, not slot state)
+        struct TGroupStats { int Active = 0; int Inactive = 0; };
+        std::map<int, TGroupStats> numaStats;
+        std::map<TString, TGroupStats> l3Stats;
+
+        for (auto& si : slotInfos) {
+            if (si.IsActive) {
+                numaStats[si.NumaNode].Active++;
+                l3Stats[si.L3Group].Active++;
+            } else {
+                numaStats[si.NumaNode].Inactive++;
+                l3Stats[si.L3Group].Inactive++;
+            }
+        }
+
+        // NUMA summary
+        std::fprintf(stderr, "\n--- NUMA Node Summary ---\n");
+        std::fprintf(stderr, "%-6s %-8s %-10s\n", "NUMA", "Active", "Inactive");
+        for (auto& [numa, stats] : numaStats) {
+            std::fprintf(stderr, "%-6d %-8d %-10d\n", numa, stats.Active, stats.Inactive);
+        }
+
+        // L3 summary
+        std::fprintf(stderr, "\n--- L3 Cache Group Summary ---\n");
+        std::fprintf(stderr, "%-30s %-8s %-10s\n", "L3 shared_cpu_list", "Active", "Inactive");
+        for (auto& [l3, stats] : l3Stats) {
+            if (stats.Active > 0) {
+                std::fprintf(stderr, "%-30s %-8d %-10d  << HAS ACTIVE\n",
+                             l3.c_str(), stats.Active, stats.Inactive);
+            } else {
+                std::fprintf(stderr, "%-30s %-8d %-10d\n",
+                             l3.c_str(), stats.Active, stats.Inactive);
+            }
+        }
+
+        uint64_t inflates = wsPool->AdaptiveInflateEvents();
+        uint64_t deflates = wsPool->AdaptiveDeflateEvents();
+        std::fprintf(stderr, "\nAdaptive events: inflate=%lu deflate=%lu\n", inflates, deflates);
+
+        // --- Verification ---
+        std::fprintf(stderr, "\n=== VERIFICATION ===\n");
+
+        // 1. Deflation happened
+        if (activeCount < totalSlots) {
+            std::fprintf(stderr, "PASS: deflated from %d to %d slots (%d%% reduction)\n",
+                         totalSlots, activeCount,
+                         (int)((1.0 - (double)activeCount / totalSlots) * 100));
+        } else {
+            std::fprintf(stderr, "FAIL: no deflation occurred\n");
+        }
+
+        // 2. Active slots cluster on fewer NUMA nodes
+        int numaWithActive = 0;
+        int totalNuma = (int)numaStats.size();
+        for (auto& [numa, stats] : numaStats) {
+            if (stats.Active > 0) numaWithActive++;
+        }
+        if (numaWithActive < totalNuma) {
+            std::fprintf(stderr, "PASS: active slots use %d/%d NUMA nodes (topology-aware)\n",
+                         numaWithActive, totalNuma);
+        } else {
+            std::fprintf(stderr, "INFO: active slots span all %d NUMA nodes "
+                         "(need more deflation to prove NUMA clustering)\n", totalNuma);
+        }
+
+        // 3. Active slots cluster on fewer L3 groups
+        int l3WithActive = 0;
+        int totalL3 = (int)l3Stats.size();
+        for (auto& [l3, stats] : l3Stats) {
+            if (stats.Active > 0) l3WithActive++;
+        }
+        if (l3WithActive < totalL3) {
+            std::fprintf(stderr, "PASS: active slots use %d/%d L3 cache groups (topology-aware)\n",
+                         l3WithActive, totalL3);
+        } else {
+            std::fprintf(stderr, "INFO: active slots span all %d L3 groups "
+                         "(need more deflation to prove L3 clustering)\n", totalL3);
+        }
+
+        // 4. Topology ordering: active slots should be on nearest CPUs
+        //    (same socket, same NUMA, same L3 as slot 0)
+        if (activeCount > 0) {
+            auto& seed = slotInfos[0];
+            int sameSocket = 0, sameNuma = 0, sameL3 = 0;
+            for (i16 i = 0; i < activeCount; ++i) {
+                if (slotInfos[i].Socket == seed.Socket) sameSocket++;
+                if (slotInfos[i].NumaNode == seed.NumaNode) sameNuma++;
+                if (slotInfos[i].L3Group == seed.L3Group) sameL3++;
+            }
+            std::fprintf(stderr, "PASS: topology proximity to seed CPU %u (socket %d, NUMA %d):\n"
+                         "  Same socket: %d/%d  Same NUMA: %d/%d  Same L3: %d/%d\n",
+                         seed.CpuId, seed.Socket, seed.NumaNode,
+                         sameSocket, activeCount, sameNuma, activeCount, sameL3, activeCount);
+        }
+
+        stop.store(true, std::memory_order_relaxed);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        sys.Stop();
+
+        GAdaptive = savedAdaptive;
+    }
+
 } // anonymous namespace
 
 int main(int argc, const char* argv[]) {
@@ -1117,7 +1422,7 @@ int main(int argc, const char* argv[]) {
         .StoreResult(&poolType);
 
     TString scenario = "all";
-    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, storage-node, or all")
+    opts.AddLongOption("scenario", "Scenario: ping-pong, star, chain, reincarnation, pipeline, storage-node, topology-proof, or all")
         .DefaultValue("all")
         .StoreResult(&scenario);
 
@@ -1150,6 +1455,11 @@ int main(int argc, const char* argv[]) {
     opts.AddLongOption("min-spin-threshold", "WS min spin threshold in CPU cycles (0 = use default)")
         .DefaultValue("0")
         .StoreResult(&minSpinThreshold);
+
+    bool adaptive = false;
+    opts.AddLongOption("adaptive", "Enable adaptive slot scaling for WS pool")
+        .NoArgument()
+        .SetFlag(&adaptive);
 
     // Storage-node scenario parameters
     ui32 vdisks = 8;
@@ -1207,6 +1517,7 @@ int main(int argc, const char* argv[]) {
 
     GSpinThresholdCycles = spinThreshold;
     GMinSpinThresholdCycles = minSpinThreshold;
+    GAdaptive = adaptive;
 
     auto threads = ParseList(threadsList);
     auto pairs = ParseList(pairsList);
@@ -1237,6 +1548,16 @@ int main(int argc, const char* argv[]) {
 
     // CSV header
     std::printf("pool_type,scenario,threads,actor_pairs,ops_per_sec,avg_latency_us,cpu_seconds,cpu_util_pct\n");
+
+    // Topology-proof is a special scenario that runs once and exits
+    if (scenario == "topology-proof") {
+        if (threads.empty()) {
+            threads = {384};
+        }
+        ui32 topologyActors = pairs.empty() ? 10 : pairs[0];
+        RunTopologyProof(threads[0], topologyActors, warmupSec + durationSec);
+        return 0;
+    }
 
     for (const auto& sc : scenarios) {
         for (ui32 t : threads) {

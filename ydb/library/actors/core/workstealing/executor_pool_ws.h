@@ -3,6 +3,7 @@
 #include "ws_slot.h"
 #include "ws_config.h"
 #include "ws_counters.h"
+#include "ws_adaptive_scaler.h"
 #include "activation_router.h"
 #include "driver.h"
 #include "ws_executor_context.h"
@@ -85,6 +86,10 @@ namespace NActors::NWorkStealing {
         void ResetCounters();
         void DumpCounters(const char* label) const;
 
+        // Adaptive scaling events (for introspection/benchmarking)
+        uint64_t AdaptiveInflateEvents() const;
+        uint64_t AdaptiveDeflateEvents() const;
+
         // Debug: last created pool instance (for benchmark introspection).
         static TWSExecutorPool* LastCreated;
 
@@ -118,6 +123,9 @@ namespace NActors::NWorkStealing {
 
         // One TWSExecutorContext per slot (created in Prepare)
         TVector<std::unique_ptr<TWSExecutorContext>> Contexts_;
+
+        // Adaptive slot scaler (created in Prepare when AdaptiveScaling=true)
+        std::unique_ptr<TAdaptiveScaler> AdaptiveScaler_;
     };
 
 } // namespace NActors::NWorkStealing

@@ -134,6 +134,13 @@ namespace NActors::NWorkStealing {
                 callbacks.Teardown = [ctx]() {
                     ctx->ClearTLS();
                 };
+                if (i == 0 && WsConfig_.AdaptiveScaling) {
+                    callbacks.AdaptiveEval = [this]() {
+                        if (AdaptiveScaler_) {
+                            AdaptiveScaler_->Evaluate();
+                        }
+                    };
+                }
                 Driver_->SetWorkerCallbacks(&Slots_[i], std::move(callbacks));
             }
 
@@ -147,6 +154,14 @@ namespace NActors::NWorkStealing {
 
         // Create the activation router
         Router_ = std::make_unique<TActivationRouter>(Slots_.data(), Slots_.size());
+
+        // Create adaptive scaler if enabled
+        if (WsConfig_.AdaptiveScaling) {
+            AdaptiveScaler_ = std::make_unique<TAdaptiveScaler>(
+                [this](i16 threads) { SetFullThreadCount(threads); },
+                [this]() -> i16 { return ActiveSlotCount_.load(std::memory_order_relaxed); },
+                Slots_.data(), MaxSlotCount_, WsConfig_);
+        }
     }
 
     void TWSExecutorPool::Start() {
@@ -347,6 +362,14 @@ namespace NActors::NWorkStealing {
 
     void TWSExecutorPool::DumpCounters(const char* label) const {
         AggregateCounters().Dump(label);
+    }
+
+    uint64_t TWSExecutorPool::AdaptiveInflateEvents() const {
+        return AdaptiveScaler_ ? AdaptiveScaler_->InflateEvents() : 0;
+    }
+
+    uint64_t TWSExecutorPool::AdaptiveDeflateEvents() const {
+        return AdaptiveScaler_ ? AdaptiveScaler_->DeflateEvents() : 0;
     }
 
 } // namespace NActors::NWorkStealing

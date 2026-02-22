@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented (Steps 0-16 complete, plus post-v1 optimizations including continuation ring). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-4.5× faster on ping-pong, 1.2-1.8× on star, 1.2-2.4× on chain, 1.3-5.9× on pipeline for the best configurations. See Section 12 for full results.
+Implemented (Steps 0-16 complete, plus post-v1 optimizations including continuation ring and adaptive slot scaling). Benchmarks on 2×EPYC 9654 (384 threads) show WS 1.3-4.5× faster on ping-pong, 1.2-1.8× on star, 1.2-2.4× on chain, 1.3-5.9× on pipeline for the best configurations. Adaptive scaling eliminates the 97.8% CPU regression on overprovisioned workloads (chain 384t/1000p: 3.1% CPU, 3.4× throughput vs non-adaptive). See Section 13 for full results and Section 9 for adaptive scaling.
 
 ## 1. Problem Statement
 
@@ -399,6 +399,15 @@ struct TWsConfig {
     uint64_t TimePerMailboxNs = 1000000;   // 1ms -- max time per mailbox execution
     uint8_t ContinuationRingCapacity = 4;  // max items in continuation ring (1-8)
     uint32_t ParkAfterIdlePolls = 64;      // (unused, kept for future use)
+
+    // Adaptive slot scaling (see Section 9)
+    bool AdaptiveScaling = false;               // master switch
+    uint64_t AdaptiveEvalCycles = 30000000;     // ~10ms at 3GHz between evaluations
+    uint64_t AdaptiveCooldownCycles = 90000000; // ~30ms cooldown after scaling change
+    double InflateUtilThreshold = 0.8;          // inflate when >=80% of active slots busy
+    double DeflateUtilThreshold = 0.3;          // deflate when <30% of active slots busy
+    double SlotBusyThreshold = 0.1;             // slot considered "busy" if >10% utilization
+    uint32_t QueuePressureThreshold = 16;       // inflate if any slot queue depth exceeds this
 };
 ```
 
@@ -419,7 +428,222 @@ When `WorkStealing` is absent or `Enabled` is false, no WS code is instantiated.
 Per-slot counters track executions, drain/steal/idle/busy polls, parks, wakes, and stolen items. These are exposed via `AggregateCounters()` for diagnostics. Full `TCpuConsumption` integration with the harmonizer (mapping per-slot execution time to harmonizer's per-thread view) is not yet implemented — current benchmarks use fixed slot counts.
 
 
-## 9. NUMA Considerations
+## 9. Adaptive Slot Scaling
+
+### Problem
+
+When a WS pool is configured with many slots (e.g. 384 on a 2-socket EPYC) but the workload only needs a few, all workers spin through PollSlot, attempt steals, and burn CPU. The spin threshold (Section 4) parks workers after ~33μs of idle spinning, but the activation router treats all Active slots equally — routing work to high-index slots wakes their workers, which spin briefly and park again. The result is 100% CPU on a workload that basic pool handles at 2%.
+
+Additionally, `TSlotStats.BusyCycles` and `IdleCycles` were never written by the worker loop, so `LoadEstimate` was always 0 and any external harmonizer got no signal.
+
+### Solution: TAdaptiveScaler
+
+A self-contained controller that runs from worker 0, monitors per-slot utilization, and adjusts the active slot count via `SetFullThreadCount`. Slots are deflated from the end (highest index first = topologically farthest, since `RegisterSlots` assigns CPUs from `GlobalCpuOrder_`). Inflation adds from the next available index.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        TWSExecutorPool                           │
+│                                                                  │
+│  Slots:  [0][1][2]...[N-1][N]...[MaxSlots-1]                   │
+│           ▲              ▲  ▲                                    │
+│           │   Active     │  │  Inactive                          │
+│           │◄────────────►│  │◄────────────►│                     │
+│           │              │  │              │                     │
+│  Deflate removes ────────┘  │              │                     │
+│  from the end (farthest)    │              │                     │
+│                             │              │                     │
+│  Inflate activates ─────────┘              │                     │
+│  next available                            │                     │
+│                                                                  │
+│  ┌─────────────────────┐                                        │
+│  │  TAdaptiveScaler    │ ← Evaluate() called from Worker 0      │
+│  │  every ~10ms        │                                        │
+│  │                     │                                        │
+│  │  Reads:  BusyCycles, IdleCycles, QueueDepth                  │
+│  │  Writes: SetFullThreadCount(newCount)                        │
+│  └─────────────────────┘                                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Load Tracking
+
+Workers write cycle counters around every PollSlot call and park:
+
+```
+Active state:
+    pollStart = rdtsc()
+    result = PollSlot(...)
+    elapsed = rdtsc() - pollStart
+
+    if (result == Busy)  → BusyCycles.fetch_add(elapsed, relaxed)
+    else                 → IdleCycles.fetch_add(elapsed, relaxed)
+
+Park (all 3 sites):
+    parkStart = rdtsc()
+    ParkPad.Park()
+    IdleCycles.fetch_add(rdtsc() - parkStart, relaxed)
+```
+
+`BusyCycles` and `IdleCycles` are `std::atomic<uint64_t>` — workers write via `fetch_add(relaxed)`, the scaler reads via `exchange(0, relaxed)` (atomic read-and-reset). Zero overhead on x86_64 (TSO), silences TSAN.
+
+### Evaluate Algorithm
+
+Worker 0 calls `Evaluate()` every `AdaptiveEvalCycles` (~10ms). The algorithm:
+
+```mermaid
+flowchart TD
+    START([Evaluate]) --> ENABLED{Adaptive<br/>enabled?}
+    ENABLED -->|no| SKIP([Return])
+    ENABLED -->|yes| COOL{Cooldown<br/>elapsed?}
+    COOL -->|no| SKIP
+
+    COOL -->|yes| SCAN[Scan active slots:<br/>exchange BusyCycles→0<br/>exchange IdleCycles→0<br/>compute per-slot util]
+
+    SCAN --> COUNT["Count busy slots<br/>(util > SlotBusyThreshold)<br/>Track max queue depth"]
+
+    COUNT --> FRAC["busyFraction =<br/>busySlots / activeCount"]
+
+    FRAC --> INF_CHECK{"busyFraction ≥ 0.8<br/>OR maxQueue > 16?"}
+    INF_CHECK -->|yes| INFLATE["newCount = min(max,<br/>active + active/4)<br/><i>+25% geometric</i>"]
+    INFLATE --> APPLY
+
+    INF_CHECK -->|no| DEF_CHECK{"busyFraction < 0.3?"}
+    DEF_CHECK -->|no| DEADBAND([Return<br/><i>no change</i>])
+
+    DEF_CHECK -->|yes| DEFLATE["target = busy + busy/4<br/>halfCurrent = active / 2<br/>newCount = max(target, half)<br/>newCount = max(1, newCount)"]
+    DEFLATE --> APPLY[SetFullThreadCount<br/>record cooldown timestamp]
+    APPLY --> DONE([Return])
+```
+
+### Hysteresis and Stability
+
+The algorithm has three mechanisms to prevent oscillation:
+
+1. **Deadband:** No action when utilization is between 30% and 80%. Only extreme underload or overload triggers scaling.
+
+2. **Cooldown:** After any scaling change, the scaler waits `AdaptiveCooldownCycles` (~30ms) before evaluating again. This gives the system time to stabilize at the new slot count.
+
+3. **Geometric rate limiting:** Deflation never removes more than 50% of active slots per step. Inflation grows by 25% per step. This prevents wild swings:
+
+```
+Deflation convergence (384 slots, 10 genuinely busy):
+
+Step 1:  384 → 192  (halve: max(target=12, half=192) = 192)
+Step 2:  192 →  96  (halve: max(target=12, half=96)  =  96)
+Step 3:   96 →  48  (halve: max(target=12, half=48)  =  48)
+Step 4:   48 →  24  (halve: max(target=12, half=24)  =  24)
+Step 5:   24 →  24  (deadband: 10/24=42% > 30%, no action)
+
+Total convergence: ~4 steps × (10ms eval + 30ms cooldown) ≈ 160ms
+```
+
+### Topology Awareness
+
+The scaler inherits topology awareness from `SetFullThreadCount`, which activates slots 0..N-1 and deactivates from N-1 down. Since `RegisterSlots()` assigns CPUs from `GlobalCpuOrder_` (topology-sorted: SMT → L3 → NUMA → distance), deflating higher-index slots removes topologically farthest workers first. No additional topology logic is needed in the scaler.
+
+```
+CPU assignment order (GlobalCpuOrder_):
+  [core0-SMT0, core0-SMT1, core1-SMT0, ..., coreN-SMTM]
+   ← nearest ─────────────────────────────── farthest →
+
+Slot index:     0    1    2    ...    N-2   N-1
+                ▲                           ▲
+                │                           │
+        always active              deflated first
+```
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `AdaptiveScaling` | `false` | Master switch. When false, no scaler is created. |
+| `AdaptiveEvalCycles` | 30,000,000 | Minimum cycles between evaluations (~10ms at 3GHz). |
+| `AdaptiveCooldownCycles` | 90,000,000 | Minimum cycles after a scaling change before the next evaluation (~30ms at 3GHz). |
+| `InflateUtilThreshold` | 0.8 | Inflate when ≥80% of active slots are busy. |
+| `DeflateUtilThreshold` | 0.3 | Deflate when <30% of active slots are busy. |
+| `SlotBusyThreshold` | 0.1 | A slot is counted as "busy" if its utilization exceeds 10%. |
+| `QueuePressureThreshold` | 16 | Inflate if any active slot's queue depth (MPMC size + continuation ring) exceeds this, regardless of utilization. Prevents throughput loss when few slots are overloaded. |
+
+When `AdaptiveScaling` is enabled, set `MinSlotCount = 1` in `TWorkStealingPoolConfig` to allow full deflation. `SetFullThreadCount` clamps to `MinSlotCount`, so the pool always retains at least one active slot.
+
+### Integration Wiring
+
+```mermaid
+sequenceDiagram
+    participant Pool as TWSExecutorPool
+    participant Scaler as TAdaptiveScaler
+    participant Driver as TThreadDriver
+    participant W0 as Worker 0
+
+    Note over Pool: Prepare()
+    Pool->>Driver: RegisterSlots(slots, maxCount)
+    Pool->>Driver: SetWorkerCallbacks(slot[0], {AdaptiveEval: ...})
+    Pool->>Scaler: create(SetFullThreadCount, GetActiveCount, slots, config)
+
+    Note over W0: WorkerLoop (Active state)
+    loop Every AdaptiveEvalCycles
+        W0->>Scaler: Evaluate()
+        Scaler->>Scaler: Scan BusyCycles/IdleCycles (exchange→0)
+        Scaler->>Scaler: Compute busyFraction, check thresholds
+
+        alt Deflate needed
+            Scaler->>Pool: SetFullThreadCount(newCount)
+            Pool->>Driver: DeactivateSlot(slot[N-1])
+            Driver->>Driver: Slot → Draining → Inactive
+        else Inflate needed
+            Scaler->>Pool: SetFullThreadCount(newCount)
+            Pool->>Driver: ActivateSlot(slot[N])
+            Driver->>Driver: Slot → Initializing → Active
+        end
+    end
+```
+
+### Benchmark Results: Adaptive vs Non-Adaptive
+
+Hardware: 2× AMD EPYC 9654 (384 threads), 10s measurement, 2s warmup.
+
+#### Chain 384t/1000p — the worst case
+
+| Pool | ops/s | CPU% | Active Slots | Deflate Events |
+|------|------:|-----:|-------------:|---------------:|
+| basic | 265,469 | 1.4% | 384 | — |
+| WS | 114,627 | **97.8%** | 384 | — |
+| **WS adaptive** | **393,695** | **3.1%** | **12** | 6 |
+
+Adaptive delivers **3.4× throughput** vs non-adaptive WS and **1.5× vs basic**, while dropping CPU from 97.8% to 3.1%. The scaler deflated 384→12 slots in ~160ms.
+
+#### Star 192t/100p
+
+| Pool | ops/s | CPU% | Active Slots | Deflate Events |
+|------|------:|-----:|-------------:|---------------:|
+| basic | 66,129 | 54.3% | 192 | — |
+| WS | 39,552 | 51.9% | 192 | — |
+| WS adaptive | 59,441 | 52.5% | 191 | 0 |
+
+No deflation — 100 senders genuinely load slots (42% busy fraction is in the deadband). Throughput improved 39K→59K from the load tracking changes.
+
+#### Ping-pong 384t/10p
+
+| Pool | ops/s | CPU% | Active Slots |
+|------|------:|-----:|-------------:|
+| basic | 1,422,386 | 61.6% | 384 |
+| WS | 2,502,198 | 5.2% | 384 |
+| WS adaptive | 2,523,442 | 5.2% | 383 |
+
+WS already efficient here (spin threshold parks idle workers). Adaptive adds no overhead — no regression.
+
+#### Pipeline 384t/100p
+
+| Pool | ops/s | CPU% | Active Slots |
+|------|------:|-----:|-------------:|
+| basic | 10,479,137 | 98.3% | 384 |
+| WS | 3,550,636 | 93.4% | 384 |
+| WS adaptive | 3,268,030 | 93.0% | 384 |
+
+No deflation — 500 actors (100 pipelines × 5 stages) genuinely load all 384 slots. The WS-vs-basic throughput gap is a separate issue (per-slot queue overhead, not idle spinning).
+
+
+## 10. NUMA Considerations
 
 The architecture is NUMA-ready by design, but NUMA-specific optimizations are deferred until benchmarks confirm single-NUMA improvement.
 
@@ -435,7 +659,7 @@ The architecture is NUMA-ready by design, but NUMA-specific optimizations are de
 - NUMA-aware mailbox memory allocation
 
 
-## 10. Prior Art
+## 11. Prior Art
 
 ### Go Runtime Scheduler
 
@@ -468,9 +692,9 @@ Storage Performance Development Kit uses pollers (non-blocking poll functions) a
 **Relevance:** Reference for Driver interface design. An SPDK-based driver could replace `TThreadDriver` to integrate YDB actors with SPDK's reactor loop.
 
 
-## 11. Implementation Summary
+## 12. Implementation Summary
 
-All 17 steps are complete. 144 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
+All 17 steps are complete. 154 unit tests pass, including stress tests with concurrent stealers and TSAN verification.
 
 ```
 Step 0  Contention Analysis           ✓
@@ -503,9 +727,11 @@ Step 16 System-level A/B Benchmarks   ✓ (ping-pong, star, chain; CSV + CPU uti
 6. **Time-based mailbox batching** (Step 7): Process events from same mailbox for up to `MailboxBatchCycles` before push-back. Amortizes queue overhead, recovering star performance.
 7. **TSAN race fixes**: (a) Write `LastPoolSlotIdx` before `FinishMailbox`/`Unlock`; (b) atomic counters for cross-thread size reads in stress tests.
 8. **Continuation ring**: Replaced single `HotContinuation` with `TContinuationRing` (FIFO, capacity 4). Budget-exhaustion leftovers saved to ring; time-swap items go to queue only. Ring occupancy exported via `ContinuationCount` for load-aware routing. See [Continuation Ring](#continuation-ring).
+9. **Atomic load tracking** (Section 9): `TSlotStats.BusyCycles` and `IdleCycles` converted to `std::atomic<uint64_t>`. Workers write via `fetch_add(relaxed)` around PollSlot and park calls. Enables `LoadEstimate` computation and adaptive scaling.
+10. **Adaptive slot scaling** (Section 9): `TAdaptiveScaler` deflates idle slots (farthest-from-core first) and inflates when load increases, with hysteresis and cooldown. Eliminates the 97.8% CPU regression on overprovisioned workloads (chain 384t/1000p → 3.1% CPU, 3.4× throughput).
 
 
-## 12. Benchmark Results
+## 13. Benchmark Results
 
 For scenario descriptions, CLI reference, and how to run on remote hardware,
 see [benchmarks.md](benchmarks.md).
@@ -618,7 +844,7 @@ A key WS advantage: at overprovisioned thread counts (threads >> active actors),
 |---------|-----------|------------|---------------|
 | Pipeline, high pairs, many threads | 384t/100p: 0.25× | Per-slot queue overhead vs basic's shared MPMC amortization across stages | Pipeline-aware routing; batch execution across pipeline stages |
 | Star, mid pairs, many threads | 192t/100p: 0.58× | Per-slot push-back overhead with many senders per slot | Adaptive batch size based on mailbox event rate |
-| Chain, many threads, high pairs | 384t/1000p: 0.56× | Workers spin on occupied queues; park mechanism too slow to converge | Faster park convergence; park after N empty steals |
+| Chain, many threads, high pairs | 384t/1000p: 0.56× | Workers spin on occupied queues; park mechanism too slow to converge | **Fixed by adaptive scaling** (Section 9): deflates to 12 slots, 3.1% CPU, 1.5× basic throughput |
 | Ping-pong, single-thread | 1t/10p: 0.91× | rdtsc overhead per event in batch loop | Check deadline every Nth event |
 
 

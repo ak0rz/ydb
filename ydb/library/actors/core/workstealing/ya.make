@@ -6,6 +6,7 @@ SRCS(
     harmonizer_adapter.cpp
     thread_driver.cpp
     topology.cpp
+    ws_adaptive_scaler.cpp
     ws_executor_context.cpp
     ws_poll.cpp
     ws_slot.cpp
