@@ -28,6 +28,7 @@ namespace NActors::NWorkStealing {
             NHPTimer::STime& hpnow)
         {
             bool hasMore = false;
+            size_t localExecs = 0;
             while (execBudget > 0) {
                 hasMore = executeCallback(activation, hpnow);
                 if (!hasMore) {
@@ -35,11 +36,13 @@ namespace NActors::NWorkStealing {
                 }
                 didWork = true;
                 --execBudget;
-                counters.Executions.fetch_add(1, std::memory_order_relaxed);
+                ++localExecs;
                 if (hpnow >= deadlineCycles) {
                     break;
                 }
             }
+            if (localExecs > 0)
+                counters.Executions.fetch_add(localExecs, std::memory_order_relaxed);
             return hasMore;
         }
     } // anonymous namespace
@@ -74,6 +77,7 @@ namespace NActors::NWorkStealing {
         // to the pre-ring code path. Zero overhead.
         std::optional<ui32> activation = pollState.Ring.Pop();
         size_t execBudget = config.MaxExecBatch;
+        size_t localExecs = 0;
         while (execBudget > 0) {
             if (!activation) {
                 activation = slot.Pop();
@@ -94,7 +98,7 @@ namespace NActors::NWorkStealing {
                 }
                 didWork = true;
                 --execBudget;
-                slot.Counters.Executions.fetch_add(1, std::memory_order_relaxed);
+                ++localExecs;
                 if (execBudget == 0) {
                     break;
                 }
@@ -120,6 +124,8 @@ namespace NActors::NWorkStealing {
                 activation.reset();
             }
         }
+        if (localExecs > 0)
+            slot.Counters.Executions.fetch_add(localExecs, std::memory_order_relaxed);
 
         // Save leftover to ring for next PollSlot's seeding.
         if (activation) {

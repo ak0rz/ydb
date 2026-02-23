@@ -3,6 +3,7 @@
 #include "ws_mailbox_table.h"
 
 #include <ydb/library/actors/core/actor.h>
+#include <ydb/library/actors/core/actor_class_stats.h>
 #include <ydb/library/actors/core/actorsystem.h>
 #include <ydb/library/actors/core/events.h>
 #include <ydb/library/actors/core/mailbox_lockfree.h>
@@ -69,38 +70,28 @@ namespace NActors::NWorkStealing {
             hpnow = GetCycleCountFast();
             hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
 
+            // Accumulate class stats locally; flush on class pointer change
             if (auto* cs = actor->GetClassStats()) {
-                cs->MessagesProcessed.fetch_add(1, std::memory_order_relaxed);
-                cs->ExecutionCycles.fetch_add(hpnow - hpprev, std::memory_order_relaxed);
+                if (cs != Accum_.LastClassStats) {
+                    FlushClassStats();
+                    Accum_.LastClassStats = cs;
+                }
+                Accum_.ClassMessages++;
+                Accum_.ClassCycles += (hpnow - hpprev);
             }
 
-            TMailboxExecStats* mboxStats = WsMailboxTable_
-                ? WsMailboxTable_->GetStats(mailbox->Hint)
-                : nullptr;
-            if (mboxStats) {
+            // Accumulate mailbox stats locally; flushed in FinishMailbox
+            if (!Accum_.MboxStats) {
+                Accum_.MboxStats = WsMailboxTable_
+                    ? WsMailboxTable_->GetStats(mailbox->Hint) : nullptr;
+                Accum_.FirstEventHpprev = hpprev;
+            }
+            if (Accum_.MboxStats) {
                 NHPTimer::STime eventCycles = hpnow - hpprev;
-
-                // Mailbox idle time: from last execution end to start of this event
-                NHPTimer::STime lastEnd = mboxStats->LastExecutionEndCycles.load(std::memory_order_relaxed);
-                if (lastEnd) {
-                    NHPTimer::STime idleCycles = hpprev - lastEnd;
-                    mboxStats->TotalIdleCycles.fetch_add(idleCycles, std::memory_order_relaxed);
-                    auto prevMaxIdle = mboxStats->MaxIdleCycles.load(std::memory_order_relaxed);
-                    if (static_cast<ui64>(idleCycles) > prevMaxIdle)
-                        mboxStats->MaxIdleCycles.store(idleCycles, std::memory_order_relaxed);
-                    auto prevMinIdle = mboxStats->MinIdleCycles.load(std::memory_order_relaxed);
-                    if (static_cast<ui64>(idleCycles) < prevMinIdle)
-                        mboxStats->MinIdleCycles.store(idleCycles, std::memory_order_relaxed);
-                }
-
-                // Execution stats
-                mboxStats->EventsProcessed.fetch_add(1, std::memory_order_relaxed);
-                mboxStats->TotalExecutionCycles.fetch_add(eventCycles, std::memory_order_relaxed);
-                auto prevMax = mboxStats->MaxExecutionCycles.load(std::memory_order_relaxed);
-                if (static_cast<ui64>(eventCycles) > prevMax)
-                    mboxStats->MaxExecutionCycles.store(eventCycles, std::memory_order_relaxed);
-
-                mboxStats->LastExecutionEndCycles.store(hpnow, std::memory_order_relaxed);
+                Accum_.Events++;
+                Accum_.TotalExecCycles += eventCycles;
+                if (static_cast<ui64>(eventCycles) > Accum_.MaxExecCycles)
+                    Accum_.MaxExecCycles = eventCycles;
             }
 
             if (!DyingActors.empty()) {
@@ -145,8 +136,48 @@ namespace NActors::NWorkStealing {
         return true;
     }
 
+    void TWSExecutorContext::FlushClassStats() {
+        if (Accum_.ClassMessages > 0 && Accum_.LastClassStats) {
+            Accum_.LastClassStats->MessagesProcessed.fetch_add(
+                Accum_.ClassMessages, std::memory_order_relaxed);
+            Accum_.LastClassStats->ExecutionCycles.fetch_add(
+                Accum_.ClassCycles, std::memory_order_relaxed);
+            Accum_.ClassMessages = 0;
+            Accum_.ClassCycles = 0;
+        }
+    }
+
+    void TWSExecutorContext::FlushAllStats(NHPTimer::STime hpnow) {
+        FlushClassStats();
+        if (auto* ms = Accum_.MboxStats) {
+            // Idle time: from last batch end to first event of this batch
+            NHPTimer::STime lastEnd = ms->LastExecutionEndCycles.load(
+                std::memory_order_relaxed);
+            if (lastEnd && Accum_.FirstEventHpprev) {
+                NHPTimer::STime idleCycles = Accum_.FirstEventHpprev - lastEnd;
+                ms->TotalIdleCycles.fetch_add(idleCycles, std::memory_order_relaxed);
+                auto curMax = ms->MaxIdleCycles.load(std::memory_order_relaxed);
+                if (static_cast<ui64>(idleCycles) > curMax)
+                    ms->MaxIdleCycles.store(idleCycles, std::memory_order_relaxed);
+                auto curMin = ms->MinIdleCycles.load(std::memory_order_relaxed);
+                if (static_cast<ui64>(idleCycles) < curMin)
+                    ms->MinIdleCycles.store(idleCycles, std::memory_order_relaxed);
+            }
+            ms->EventsProcessed.fetch_add(Accum_.Events, std::memory_order_relaxed);
+            ms->TotalExecutionCycles.fetch_add(Accum_.TotalExecCycles,
+                std::memory_order_relaxed);
+            auto curMax = ms->MaxExecutionCycles.load(std::memory_order_relaxed);
+            if (Accum_.MaxExecCycles > curMax)
+                ms->MaxExecutionCycles.store(Accum_.MaxExecCycles,
+                    std::memory_order_relaxed);
+            ms->LastExecutionEndCycles.store(hpnow, std::memory_order_relaxed);
+        }
+        Accum_.Reset();
+    }
+
     void TWSExecutorContext::FinishMailbox(TMailbox* mailbox) {
         NHPTimer::STime hpnow = GetCycleCountFast();
+        FlushAllStats(hpnow);
         TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
         TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
 
