@@ -64,6 +64,10 @@ namespace NActors::NWorkStealing {
         void SetWsMailboxTable(TWsMailboxTable* table) { WsMailboxTable_ = table; }
         void SetSlotAllocator(TWsSlotAllocator* alloc) { SlotAllocator_ = alloc; }
 
+        // Commit any remaining local cursor events back to the mailbox's EventHead.
+        // Called by EndBatch callback after each activation batch.
+        void CommitLocalCursor();
+
         // Do NOT start the thread.
         // TThread::Start() is never called.
     private:
@@ -102,6 +106,14 @@ namespace NActors::NWorkStealing {
         TWsMailboxTable* WsMailboxTable_ = nullptr;
         TWsSlotAllocator* SlotAllocator_ = nullptr;
         TStatsAccumulator Accum_;
+
+        // Local batch cursor — avoids writing mailbox->EventHead on every Pop.
+        // EventHead shares a cache line with NextEventPtr (producer CAS target).
+        // By reading events from a local pointer, we eliminate false-sharing
+        // between senders (CAS on NextEventPtr) and the receiver (read EventHead).
+        IEventHandle* LocalHead_ = nullptr;
+        IEventHandle* LocalTail_ = nullptr;
+        TMailbox* CurrentBatchMailbox_ = nullptr;
     };
 
 } // namespace NActors::NWorkStealing

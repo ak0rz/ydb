@@ -13,6 +13,8 @@ namespace NActors::NWorkStealing {
     struct TWorkerCallbacks {
         TExecuteCallback Execute;       // Called per activation (ui32 hint -> bool preempted)
         TOverflowCallback Overflow;     // Ring overflow → reroute activation to another slot
+        TBeginBatchCallback BeginBatch; // Called before each activation batch (drain pending events)
+        TEndBatchCallback EndBatch;     // Called after each activation batch (commit local cursor)
         std::function<void()> Setup;    // Called once at worker thread start (TLS setup)
         std::function<void()> Teardown; // Called once at worker thread end (TLS cleanup)
         std::function<void()> AdaptiveEval; // Periodic eval from worker 0 (adaptive scaling)

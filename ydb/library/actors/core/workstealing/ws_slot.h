@@ -53,7 +53,8 @@ namespace NActors::NWorkStealing {
         // --- Push/Pop API ---
 
         // Push an activation into this slot's MPMC queue.
-        void Push(ui32 hint);
+        // Returns false if the slot is not Active (caller must reroute).
+        bool Push(ui32 hint);
 
         // Pop the next activation. Returns nullopt if the queue is empty.
         std::optional<ui32> Pop();
@@ -76,6 +77,8 @@ namespace NActors::NWorkStealing {
         std::atomic<bool> WorkerSpinning{false};
         std::atomic<bool> Executing{false};   // true while inside executeCallback
         std::atomic<uint8_t> ContinuationCount{0};  // ring occupancy, read by router
+        std::atomic<ui32> RingSnapshot[8] = {};       // snapshot of ring items (updated by worker)
+
         void* DriverData = nullptr;
         TWsMailboxTable* WsMailboxTable = nullptr;  // set by pool init (WS pools), used for cost-aware stealing
         uint32_t AssignedCpu = 0;  // CPU id assigned by topology ordering (set by driver)

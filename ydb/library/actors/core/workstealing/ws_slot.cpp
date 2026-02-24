@@ -35,9 +35,14 @@ namespace NActors::NWorkStealing {
         return State_.load(std::memory_order_relaxed);
     }
 
-    void TSlot::Push(ui32 hint) {
+    bool TSlot::Push(ui32 hint) {
+        ESlotState state = State_.load(std::memory_order_acquire);
+        if (state != ESlotState::Active && state != ESlotState::Draining) {
+            return false;
+        }
         Queue_.Push(hint);
         ApproxSize_.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     std::optional<ui32> TSlot::Pop() {
@@ -50,10 +55,8 @@ namespace NActors::NWorkStealing {
     }
 
     size_t TSlot::Steal(ui32* out, size_t maxCount, NHPTimer::STime cyclesBudget) {
-        ESlotState state = State_.load(std::memory_order_acquire);
-        if (state != ESlotState::Active && state != ESlotState::Draining) {
-            return 0;
-        }
+        // Allow stealing from any state — acts as a safety net for
+        // activations stranded in Inactive/Draining slots.
         NHPTimer::STime totalCost = 0;
         size_t count = 0;
         while (count < maxCount) {

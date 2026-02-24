@@ -303,7 +303,7 @@ namespace NActors::NWorkStealing {
             if (slotState == ESlotState::Draining) {
                 // Drain remaining activations without stealing — slot is winding down.
                 ui64 pollStartTs = GetCycleCountFast();
-                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState);
+                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState, worker.Callbacks.BeginBatch, worker.Callbacks.EndBatch);
                 ui64 pollElapsed = GetCycleCountFast() - pollStartTs;
                 if (result == EPollResult::Busy) {
                     worker.Slot->Stats.BusyCycles.fetch_add(pollElapsed, std::memory_order_relaxed);
@@ -332,12 +332,14 @@ namespace NActors::NWorkStealing {
                 // Complete deactivation.
                 worker.Slot->TryTransition(ESlotState::Draining, ESlotState::Inactive);
 
-                // Final safety net: execute items that raced with the transition.
+                // Final safety net: reroute items that raced with the transition.
                 // After Inactive, no new Route() calls will target this slot.
+                // We must NOT execute here — a single Execute call processes one
+                // event but does not reschedule the activation if the mailbox has
+                // more events, leading to stalled mailboxes.
                 while (auto item = worker.Slot->Pop()) {
-                    if (worker.Callbacks.Execute) {
-                        NHPTimer::STime hpnow = GetCycleCountFast();
-                        worker.Callbacks.Execute(*item, hpnow);
+                    if (worker.Callbacks.Overflow) {
+                        worker.Callbacks.Overflow(*item);
                     }
                 }
 
@@ -375,7 +377,7 @@ namespace NActors::NWorkStealing {
             }
 
             ui64 pollStartTs = GetCycleCountFast();
-            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState);
+            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState, worker.Callbacks.BeginBatch, worker.Callbacks.EndBatch);
             ui64 pollElapsed = GetCycleCountFast() - pollStartTs;
 
             if (result == EPollResult::Busy) {

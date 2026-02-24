@@ -42,34 +42,18 @@ namespace NActors::NWorkStealing {
             }
         }
 
-        ui16 rangeSize = end - begin;
-
-        // Sticky routing: try the last slot that executed this mailbox,
-        // but only if it's within the current bucket range and not overloaded.
+        // Sticky routing: always prefer the last slot that executed this mailbox.
+        // Stealers handle load balancing — keeping affinity preserves cache locality.
         if (lastSlotIdx > 0 && lastSlotIdx <= activeCount) {
             size_t idx = lastSlotIdx - 1;
 
             // Check if sticky slot is within the bucket range
             bool inBucket = (idx >= begin && idx < end);
 
-            if (inBucket && Slots_[idx].GetState() == ESlotState::Active) {
-                size_t stickyLoad = Slots_[idx].SizeEstimate()
-                                  + Slots_[idx].ContinuationCount.load(std::memory_order_relaxed);
-                if (stickyLoad <= 1) {
-                    Slots_[idx].Push(hint);
-                    return static_cast<int>(idx);
-                }
-                // Compare with a hash-derived peer within bucket range
-                size_t peer = begin + ((hint ^ 0x9e3779b9u) % rangeSize);
-                size_t peerLoad = Slots_[peer].SizeEstimate()
-                                + Slots_[peer].ContinuationCount.load(std::memory_order_relaxed);
-                if (stickyLoad <= peerLoad * 2 + 2) {
-                    Slots_[idx].Push(hint);
-                    return static_cast<int>(idx);
-                }
+            if (inBucket && Slots_[idx].Push(hint)) {
+                return static_cast<int>(idx);
             }
-            // If lastSlotIdx is outside the bucket range (mailbox was reclassified),
-            // fall through to fresh p2 routing into the correct bucket.
+            // Push failed (slot transitioning) or outside bucket — fall through
         }
 
         // Fallback: power-of-two hash choice within bucket range
@@ -95,8 +79,7 @@ namespace NActors::NWorkStealing {
         }
 
         if (rangeSize == 1) {
-            if (Slots_[begin].GetState() == ESlotState::Active) {
-                Slots_[begin].Push(hint);
+            if (Slots_[begin].Push(hint)) {
                 return static_cast<int>(begin);
             }
             return -1;
@@ -119,19 +102,16 @@ namespace NActors::NWorkStealing {
         size_t first = (loadA <= loadB) ? idxA : idxB;
         size_t second = (first == idxA) ? idxB : idxA;
 
-        if (Slots_[first].GetState() == ESlotState::Active) {
-            Slots_[first].Push(hint);
+        if (Slots_[first].Push(hint)) {
             return static_cast<int>(first);
         }
-        if (Slots_[second].GetState() == ESlotState::Active) {
-            Slots_[second].Push(hint);
+        if (Slots_[second].Push(hint)) {
             return static_cast<int>(second);
         }
 
-        // All candidates transitioning away — try any active slot in range
+        // Both candidates rejected — try any active slot in range
         for (ui16 i = begin; i < end; ++i) {
-            if (Slots_[i].GetState() == ESlotState::Active) {
-                Slots_[i].Push(hint);
+            if (Slots_[i].Push(hint)) {
                 return static_cast<int>(i);
             }
         }

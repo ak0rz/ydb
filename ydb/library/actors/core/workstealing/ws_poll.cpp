@@ -25,7 +25,8 @@ namespace NActors::NWorkStealing {
             size_t& execBudget,
             bool& didWork,
             TWsSlotCounters& counters,
-            NHPTimer::STime& hpnow)
+            NHPTimer::STime& hpnow,
+            const TEndBatchCallback& endBatchCallback)
         {
             bool hasMore = false;
             size_t localExecs = 0;
@@ -43,7 +44,22 @@ namespace NActors::NWorkStealing {
             }
             if (localExecs > 0)
                 counters.Executions.fetch_add(localExecs, std::memory_order_relaxed);
+            // Commit local batch cursor before the hint can leave this slot
+            if (endBatchCallback)
+                endBatchCallback(activation);
             return hasMore;
+        }
+
+        // Try to save an activation that still has work.
+        // Prefer ring (hot L1 path), fall back to queue.
+        void SaveContinuation(ui32 activation, TContinuationRing& ring,
+                              TSlot& slot, TWsSlotCounters& counters) {
+            if (!ring.Push(activation)) {
+                slot.Push(activation);
+                counters.RingOverflows.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                counters.HotContinuations.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     } // anonymous namespace
 
@@ -53,92 +69,69 @@ namespace NActors::NWorkStealing {
         const TExecuteCallback& executeCallback,
         const TOverflowCallback& overflowCallback,
         const TWsConfig& config,
-        TPollState& pollState)
+        TPollState& pollState,
+        const TBeginBatchCallback& beginBatchCallback,
+        const TEndBatchCallback& endBatchCallback)
     {
         Y_UNUSED(overflowCallback);  // reserved for future active load-shedding
 
         bool didWork = false;
+        // Phase 1: Take up to two activations — one from ring, one from queue.
+        // Execute each sequentially with its own time budget.
+        // Survivors go back to ring (or queue if ring full).
+        std::optional<ui32> ringItem = pollState.Ring.Pop();
+        std::optional<ui32> queueItem = slot.Pop();
 
-        // Queue processing with continuation ring seeding.
-        //
-        // The ring holds activations that exhausted the entire event budget
-        // on a previous PollSlot — proven hottest. One ring item is popped
-        // to seed the loop, giving it first-execution priority. Remaining
-        // ring items are consumed in subsequent PollSlots.
-        //
-        // Each mailbox runs for up to MailboxBatchCycles. When the time
-        // deadline expires, we check the queue inline:
-        //   - Other work waiting: push current to queue tail, pop next.
-        //     Only budget-exhaustion leftovers go to ring (not time swaps).
-        //   - Queue empty: reset deadline, continue same mailbox. Avoids
-        //     unnecessary overhead and false steal potential.
-        //
-        // When ring is empty: seed falls through to slot.Pop() — identical
-        // to the pre-ring code path. Zero overhead.
-        std::optional<ui32> activation = pollState.Ring.Pop();
-        size_t execBudget = config.MaxExecBatch;
-        size_t localExecs = 0;
-        while (execBudget > 0) {
-            if (!activation) {
-                activation = slot.Pop();
-                if (!activation) {
-                    break;
-                }
-            }
-
+        // Execute ring item first (proven hot from prior PollSlot)
+        if (ringItem) {
+            ui64 preBatchCount = beginBatchCallback ? beginBatchCallback(*ringItem) : 0;
+            size_t execBudget = config.MaxExecBatch;
             slot.Executing.store(true, std::memory_order_release);
             NHPTimer::STime hpnow = GetCycleCountFast();
             NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
-
-            bool hasMore = false;
-            for (;;) {
-                hasMore = executeCallback(*activation, hpnow);
-                if (!hasMore) {
-                    break;
-                }
-                didWork = true;
-                --execBudget;
-                ++localExecs;
-                if (execBudget == 0) {
-                    break;
-                }
-                if (hpnow >= deadline) {
-                    // Time slice expired — check if queue has other work
-                    auto next = slot.Pop();
-                    if (next) {
-                        // Push current to queue tail for fair interleaving.
-                        // Only budget-exhaustion leftovers go to the ring
-                        // (proven hottest — survived the entire budget).
-                        slot.Push(*activation);
-                        activation = next;
-                        break;
-                    }
-                    // Queue empty — continue same mailbox, reset deadline
-                    deadline = hpnow + config.MailboxBatchCycles;
-                }
-            }
-
+            bool hasMore = ExecuteBatch(executeCallback, *ringItem, deadline,
+                                        execBudget, didWork, slot.Counters, hpnow,
+                                        endBatchCallback);
             slot.Executing.store(false, std::memory_order_release);
 
-            if (!hasMore) {
-                activation.reset();
-            }
-        }
-        if (localExecs > 0)
-            slot.Counters.Executions.fetch_add(localExecs, std::memory_order_relaxed);
-
-        // Save leftover to ring for next PollSlot's seeding.
-        if (activation) {
-            if (!pollState.Ring.Push(*activation)) {
-                slot.Push(*activation);
-                slot.Counters.RingOverflows.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                slot.Counters.HotContinuations.fetch_add(1, std::memory_order_relaxed);
+            if (hasMore) {
+                // Single-event activations (self-send / ping-pong) skip the
+                // ring and go back to the queue. This prevents self-senders
+                // from monopolizing the continuation ring indefinitely.
+                // Only applies when beginBatchCallback is present (provides
+                // the drain count). Without it, always use ring.
+                if (beginBatchCallback && preBatchCount <= 1) {
+                    slot.Push(*ringItem);
+                } else {
+                    SaveContinuation(*ringItem, pollState.Ring, slot, slot.Counters);
+                }
             }
         }
 
-        // Update ring occupancy for router visibility
+        // Execute queue item
+        if (queueItem) {
+            ui64 preBatchCount = beginBatchCallback ? beginBatchCallback(*queueItem) : 0;
+            size_t execBudget = config.MaxExecBatch;
+            slot.Executing.store(true, std::memory_order_release);
+            NHPTimer::STime hpnow = GetCycleCountFast();
+            NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
+            bool hasMore = ExecuteBatch(executeCallback, *queueItem, deadline,
+                                        execBudget, didWork, slot.Counters, hpnow,
+                                        endBatchCallback);
+            slot.Executing.store(false, std::memory_order_release);
+
+            if (hasMore) {
+                if (beginBatchCallback && preBatchCount <= 1) {
+                    slot.Push(*queueItem);
+                } else {
+                    SaveContinuation(*queueItem, pollState.Ring, slot, slot.Counters);
+                }
+            }
+        }
+
+        // Update ring occupancy + content snapshot for router/diagnostic visibility
         slot.ContinuationCount.store(pollState.Ring.Size(), std::memory_order_relaxed);
+        pollState.Ring.SnapshotTo(slot);
 
         if (didWork) {
             slot.Counters.BusyPolls.fetch_add(1, std::memory_order_relaxed);
@@ -161,7 +154,7 @@ namespace NActors::NWorkStealing {
         bool shouldSteal = (pollState.ConsecutiveIdle >= pollState.NextStealAtIdle);
 
         if (shouldSteal && stealIterator) {
-            constexpr size_t kStealBufSize = 128;
+            constexpr size_t kStealBufSize = 1;
             ui32 stealBuf[kStealBufSize];
 
             stealIterator->Reset();
@@ -183,18 +176,29 @@ namespace NActors::NWorkStealing {
                 // pushed to our queue first, so they can't be re-stolen
                 // while we process them. Only items that still have events
                 // after ExecuteBatch are pushed to our local queue.
+                size_t execBudget = config.MaxExecBatch;
                 NHPTimer::STime hpnow = GetCycleCountFast();
+                size_t processed = 0;
                 for (size_t i = 0; i < stolen && execBudget > 0; ++i) {
+                    if (beginBatchCallback) (void)beginBatchCallback(stealBuf[i]);
                     slot.Executing.store(true, std::memory_order_release);
                     NHPTimer::STime deadline = hpnow + config.MailboxBatchCycles;
                     bool hasMore = ExecuteBatch(
                         executeCallback, stealBuf[i], deadline,
-                        execBudget, didWork, slot.Counters, hpnow);
+                        execBudget, didWork, slot.Counters, hpnow,
+                        endBatchCallback);
                     slot.Executing.store(false, std::memory_order_release);
 
                     if (hasMore) {
                         slot.Push(stealBuf[i]);  // push back only if mailbox still has events
                     }
+                    processed = i + 1;
+                }
+                // Spill back unprocessed stolen items — they were already
+                // popped from the victim's queue, so we must re-queue them
+                // to prevent activation loss.
+                for (size_t i = processed; i < stolen; ++i) {
+                    slot.Push(stealBuf[i]);
                 }
 
                 if (didWork) {

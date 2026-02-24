@@ -95,6 +95,9 @@ namespace NActors::NWorkStealing {
         void ResetCounters();
         void DumpCounters(const char* label) const;
 
+        // Per-slot state, queue size, ring occupancy, worker state
+        void DumpSlots(IOutputStream& out) const;
+
         // Adaptive scaling events (for introspection/benchmarking)
         uint64_t AdaptiveInflateEvents() const;
         uint64_t AdaptiveDeflateEvents() const;

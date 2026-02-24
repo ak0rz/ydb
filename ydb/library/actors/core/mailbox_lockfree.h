@@ -164,6 +164,18 @@ namespace NActors {
         void PushFront(std::unique_ptr<IEventHandle>&& ev) noexcept;
 
         /**
+         * Drains all events from NextEventPtr into the EventHead/EventTail
+         * chain. After this call, all pending events are in EventHead and
+         * NextEventPtr is empty (for a locked mailbox).
+         *
+         * Returns the number of events drained.
+         *
+         * Used by work-stealing to snapshot pre-existing events before
+         * a batch so the caller can limit execution to that count.
+         */
+        ui64 DrainPending() noexcept;
+
+        /**
          * Returns true for free mailboxes
          */
         bool IsFree() const noexcept;
@@ -175,6 +187,14 @@ namespace NActors {
          * and need to be processed individually until Pop() returns nullptr.
          */
         void LockToFree() noexcept;
+
+        /**
+         * Race-safe variant of LockToFree. Uses CAS instead of exchange,
+         * so it fails (returns false) if events arrived in NextEventPtr
+         * between the caller's IsEmpty() check and this call.
+         * On failure the mailbox stays locked — caller should use Unlock().
+         */
+        bool TryLockToFree() noexcept;
 
         /**
          * Locks the mailbox after initial state or a LockToFree call.
@@ -193,6 +213,25 @@ namespace NActors {
             Y_DEBUG_ABORT_UNLESS(IsFree());
             return !EventHead;
         }
+
+        /**
+         * Refill EventHead from NextEventPtr (via PreProcessEvents) if empty,
+         * then detach the entire EventHead chain. Returns the head of the
+         * chain or nullptr. Writes the tail to *tailOut when non-null.
+         * Caller owns the chain until ReattachEventChain.
+         *
+         * Lock holder only. Used by WS local-cursor batch processing to
+         * avoid per-event writes to EventHead (same cache line as NextEventPtr).
+         */
+        IEventHandle* DrainToLocal(IEventHandle*& tailOut) noexcept;
+
+        /**
+         * Prepend a previously detached chain back to EventHead.
+         * localHead/localTail bracket the chain (linked via NextLinkPtr).
+         * O(1) — no traversal needed when tail is known.
+         * Lock holder only.
+         */
+        void ReattachEventChain(IEventHandle* localHead, IEventHandle* localTail) noexcept;
 
     private:
         void EnsureActorMap();

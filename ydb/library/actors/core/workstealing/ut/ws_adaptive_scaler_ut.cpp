@@ -172,6 +172,9 @@ namespace NActors::NWorkStealing {
             h.ActiveCount = 4;
             // Low utilization but high queue depth
             h.SetAllUtil(0.05);
+            // Activate slot before pushing (Push requires Active state)
+            h.Slots[0].TryTransition(ESlotState::Inactive, ESlotState::Initializing);
+            h.Slots[0].TryTransition(ESlotState::Initializing, ESlotState::Active);
             // Simulate queue pressure by pushing items into a slot's queue
             for (uint32_t i = 0; i < 20; ++i) {
                 h.Slots[0].Push(i);

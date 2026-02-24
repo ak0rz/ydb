@@ -34,11 +34,42 @@ namespace NActors::NWorkStealing {
         TlsThreadContext = nullptr;
     }
 
+    void TWSExecutorContext::CommitLocalCursor() {
+        if (LocalHead_ && CurrentBatchMailbox_) {
+            CurrentBatchMailbox_->ReattachEventChain(LocalHead_, LocalTail_);
+            LocalHead_ = nullptr;
+            LocalTail_ = nullptr;
+        }
+        CurrentBatchMailbox_ = nullptr;
+    }
+
     bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
-        std::unique_ptr<IEventHandle> ev = mailbox->Pop();
-        if (!ev) {
+        // Pop from local cursor to avoid writing mailbox->EventHead per event.
+        // EventHead shares a cache line with NextEventPtr (producer CAS target);
+        // writing it on every Pop causes false sharing under high sender count.
+        if (!LocalHead_) {
+            // Local cursor exhausted — refill from mailbox
+            LocalHead_ = mailbox->DrainToLocal(LocalTail_);
+            CurrentBatchMailbox_ = mailbox;
+        }
+
+        IEventHandle* rawEv = LocalHead_;
+        if (rawEv) {
+            LocalHead_ = reinterpret_cast<IEventHandle*>(
+                rawEv->NextLinkPtr.load(std::memory_order_relaxed));
+            rawEv->NextLinkPtr.store(0, std::memory_order_relaxed);
+            if (!LocalHead_) {
+                LocalTail_ = nullptr;
+            }
+        }
+
+        if (!rawEv) {
+            LocalTail_ = nullptr;
+            CurrentBatchMailbox_ = nullptr;
             return false;
         }
+
+        std::unique_ptr<IEventHandle> ev(rawEv);
 
         NHPTimer::STime hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
         ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
@@ -181,28 +212,30 @@ namespace NActors::NWorkStealing {
         TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
         TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
 
-        if (mailbox->IsEmpty() && !mailbox->IsFree()) {
-            mailbox->LockToFree();
-        }
-
-        if (mailbox->IsFree() && mailbox->CanReclaim()) {
-            if (BucketMap_) {
-                BucketMap_->ResetBucket(mailbox->Hint);
-            }
+        if (mailbox->IsFree()) {
+            // Mailbox was freed inside ExecuteSingleEvent (LockToFree after
+            // last actor PassAway'd). Return the hint to the allocator so
+            // it can be reused by future Register() calls.
             if (SlotAllocator_) {
                 SlotAllocator_->Free(mailbox->Hint);
-            } else {
-                ThreadCtx.FreeMailbox(mailbox);
             }
-        } else if (!mailbox->IsFree()) {
-            mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);
+            return;
         }
-        // IsFree && !CanReclaim: LockToFree drained late-arriving events into
-        // EventHead. These were already processed by prior ExecuteSingleEvent
-        // calls (Pop drains EventHead). If we reach here, it means events
-        // arrived between the last Pop (which returned nullptr) and LockToFree.
-        // The mailbox is free with pending events — let them be cleaned up
-        // by the mailbox table reclamation.
+
+        // Reclaim empty mailboxes (last actor called PassAway).
+        // Check: no actors, no pre-processed events in EventHead.
+        // TryLockToFree uses CAS (0 → MarkerFree), so it fails safely
+        // if a concurrent Push arrived — we fall through to Unlock.
+        if (mailbox->IsEmpty() && !mailbox->EventHead
+                && mailbox->TryLockToFree())
+        {
+            if (SlotAllocator_) {
+                SlotAllocator_->Free(mailbox->Hint);
+            }
+            return;
+        }
+
+        mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);
     }
 
 } // namespace NActors::NWorkStealing

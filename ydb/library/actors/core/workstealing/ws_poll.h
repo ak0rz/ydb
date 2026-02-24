@@ -44,6 +44,15 @@ namespace NActors::NWorkStealing {
     // Callback for ring overflow — reroutes activation to another slot.
     using TOverflowCallback = std::function<void(ui32 hint)>;
 
+    // Called before each activation batch. Returns the number of
+    // pre-existing events (used to decide continuation eligibility).
+    // Single-event activations (self-sends) skip the continuation ring.
+    using TBeginBatchCallback = std::function<ui64(ui32 hint)>;
+
+    // Called after each activation batch. Used by WS to commit
+    // local batch cursors back to EventHead.
+    using TEndBatchCallback = std::function<void(ui32 hint)>;
+
     // Stack-allocated fixed-capacity FIFO ring for hot continuations.
     // Single-threaded — accessed only by the owning worker.
     struct TContinuationRing {
@@ -76,6 +85,17 @@ namespace NActors::NWorkStealing {
         void FlushTo(TSlot& slot) {
             while (!Empty()) {
                 slot.Push(*Pop());
+            }
+        }
+
+        // Copy current ring contents to a snapshot array on the slot.
+        void SnapshotTo(TSlot& slot) const {
+            for (uint8_t i = 0; i < Count; ++i) {
+                slot.RingSnapshot[i].store(Items[(Head + i) % kMaxCapacity],
+                                           std::memory_order_relaxed);
+            }
+            for (uint8_t i = Count; i < kMaxCapacity; ++i) {
+                slot.RingSnapshot[i].store(0, std::memory_order_relaxed);
             }
         }
 
@@ -128,6 +148,8 @@ namespace NActors::NWorkStealing {
         const TExecuteCallback& executeCallback,
         const TOverflowCallback& overflowCallback,
         const TWsConfig& config,
-        TPollState& pollState);
+        TPollState& pollState,
+        const TBeginBatchCallback& beginBatchCallback = {},
+        const TEndBatchCallback& endBatchCallback = {});
 
 } // namespace NActors::NWorkStealing

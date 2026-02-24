@@ -68,6 +68,7 @@ namespace {
     // Global overrides (0 = use default from TWsConfig)
     ui64 GSpinThresholdCycles = 0;
     ui64 GMinSpinThresholdCycles = 0;
+    ui64 GMailboxBatchCycles = 0;  // 0 = use default
 
     // -------------------------------------------------------------------
     // Actor system setup factories
@@ -128,6 +129,9 @@ namespace {
         }
         if (GSlotBucketing) {
             wsCfg.WsConfig.SlotBucketing = true;
+        }
+        if (GMailboxBatchCycles > 0) {
+            wsCfg.WsConfig.MailboxBatchCycles = GMailboxBatchCycles;
         }
         setup->CpuManager.WorkStealing = NActors::TWorkStealingConfig{
             .Enabled = true,
@@ -252,10 +256,14 @@ namespace {
 
     class TStarSender: public NActors::TActor<TStarSender> {
     public:
-        TStarSender(NActors::TActorId receiver, std::atomic<bool>& stop)
+        TStarSender(NActors::TActorId receiver, std::atomic<bool>& stop,
+                     std::atomic<ui64>* sendCount = nullptr,
+                     ui64 workIters = 0)
             : TActor(&TStarSender::StateFunc)
             , Receiver_(receiver)
             , Stop_(stop)
+            , SendCount_(sendCount)
+            , WorkIters_(workIters)
         {
         }
 
@@ -264,14 +272,22 @@ namespace {
             if (Stop_.load(std::memory_order_relaxed)) {
                 return;
             }
+            if (WorkIters_ > 0) {
+                BusyWork(WorkIters_);
+            }
             // Send a message to the receiver, then send another to self to keep going
             Send(Receiver_, new TEvBenchMsg());
+            if (SendCount_) {
+                SendCount_->fetch_add(1, std::memory_order_relaxed);
+            }
             Send(SelfId(), new TEvBenchMsg());
         }
 
     private:
         NActors::TActorId Receiver_;
         std::atomic<bool>& Stop_;
+        std::atomic<ui64>* SendCount_;
+        ui64 WorkIters_;
     };
 
     // -------------------------------------------------------------------
@@ -931,7 +947,8 @@ namespace {
     }
 
     TBenchResult RunStar(const TString& poolType, ui32 threads, ui32 senders,
-                         ui32 warmupSec, ui32 durationSec) {
+                         ui32 warmupSec, ui32 durationSec,
+                         ui64 senderWorkIters = 0) {
         auto setup = (poolType == "ws") ? MakeWSSetup(threads, GSpinThresholdCycles) : MakeBasicSetup(threads);
         NActors::TActorSystem sys(setup);
         sys.Start();
@@ -940,6 +957,7 @@ namespace {
 
         std::atomic<ui64> counter{0};
         std::atomic<bool> stop{false};
+        std::atomic<ui64> sendToReceiverCount{0};
 
         // One receiver
         auto* receiver = new TStarReceiver(counter);
@@ -947,7 +965,7 @@ namespace {
 
         // N senders
         for (ui32 i = 0; i < senders; ++i) {
-            auto* sender = new TStarSender(receiverId, stop);
+            auto* sender = new TStarSender(receiverId, stop, &sendToReceiverCount, senderWorkIters);
             NActors::TActorId senderId = sys.Register(sender, NActors::TMailboxType::HTSwap, pool);
             // Kick off
             sys.Send(senderId, new TEvBenchMsg());
@@ -956,6 +974,7 @@ namespace {
         // Warmup
         std::this_thread::sleep_for(std::chrono::seconds(warmupSec));
         counter.store(0, std::memory_order_relaxed);
+        sendToReceiverCount.store(0, std::memory_order_relaxed);
         ResetWsCounters();
 
         // Measure
@@ -2196,6 +2215,16 @@ int main(int argc, const char* argv[]) {
         .NoArgument()
         .SetFlag(&slotBucketing);
 
+    ui64 mailboxBatchUs = 0;
+    opts.AddLongOption("mailbox-batch-us", "Override MailboxBatchCycles (converted from microseconds, 0 = default ~17us)")
+        .DefaultValue("0")
+        .StoreResult(&mailboxBatchUs);
+
+    ui64 senderWork = 0;
+    opts.AddLongOption("sender-work", "CPU work iterations per sender event (~1 iter ≈ 1 ns)")
+        .DefaultValue("0")
+        .StoreResult(&senderWork);
+
     // Storage-node scenario parameters
     ui32 vdisks = 8;
     opts.AddLongOption("vdisks", "Number of VDisk actor groups (storage-node scenario)")
@@ -2275,6 +2304,12 @@ int main(int argc, const char* argv[]) {
     GMinSpinThresholdCycles = minSpinThreshold;
     GAdaptive = adaptive;
     GSlotBucketing = slotBucketing;
+    if (mailboxBatchUs > 0) {
+        // Convert microseconds to TSC cycles: cycles = us * clockRate / 1e6
+        GMailboxBatchCycles = static_cast<ui64>(mailboxBatchUs * NHPTimer::GetClockRate() / 1e6);
+        std::fprintf(stderr, "Override: MailboxBatchCycles=%lu (from %lu us)\n",
+                     GMailboxBatchCycles, mailboxBatchUs);
+    }
 
     auto threads = ParseList(threadsList);
     auto pairs = ParseList(pairsList);
@@ -2379,7 +2414,7 @@ int main(int argc, const char* argv[]) {
                         if (sc == "ping-pong") {
                             result = RunPingPong(pt, t, p, warmupSec, durationSec);
                         } else if (sc == "star") {
-                            result = RunStar(pt, t, p, warmupSec, durationSec);
+                            result = RunStar(pt, t, p, warmupSec, durationSec, senderWork);
                         } else if (sc == "chain") {
                             result = RunChain(pt, t, p, warmupSec, durationSec);
                         } else if (sc == "reincarnation") {

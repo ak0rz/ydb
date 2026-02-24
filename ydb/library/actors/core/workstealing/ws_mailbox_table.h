@@ -47,6 +47,7 @@ namespace NActors::NWorkStealing {
     class TWsMailboxTable {
     public:
         static constexpr size_t MaxSegments = 512;
+        // 2MB hugepage / sizeof(TMailbox) — kept as power of 2
         static constexpr size_t MailboxesPerSegment = 32768;  // 2^15
         static constexpr int SegmentShift = 15;
         static constexpr ui32 OffsetMask = 0x7FFF;
@@ -55,7 +56,7 @@ namespace NActors::NWorkStealing {
         static constexpr size_t LinesCount = MaxSegments;
         static constexpr size_t MailboxesPerLine = MailboxesPerSegment;
         static constexpr int LineIndexShift = SegmentShift;
-        static constexpr ui32 LineIndexMask = 0x1FFFF;  // 17 bits
+        static constexpr ui32 LineIndexMask = 0x1FFFF;  // 17 bits (32 - SegmentShift)
         static constexpr ui32 MailboxIndexMask = OffsetMask;
 
         TWsMailboxTable();

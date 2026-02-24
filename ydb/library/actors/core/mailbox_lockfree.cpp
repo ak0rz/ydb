@@ -461,6 +461,31 @@ namespace NActors {
         return nullptr;
     }
 
+    IEventHandle* TMailbox::DrainToLocal(IEventHandle*& tailOut) noexcept {
+        if (!EventHead) {
+            PreProcessEvents();
+        }
+        IEventHandle* head = EventHead;
+        tailOut = EventTail;
+        EventHead = nullptr;
+        EventTail = nullptr;
+        return head;
+    }
+
+    void TMailbox::ReattachEventChain(IEventHandle* localHead, IEventHandle* localTail) noexcept {
+        if (!localHead) {
+            return;
+        }
+        // Prepend to existing EventHead (local events are older)
+        if (EventHead) {
+            SetNextPtr(localTail, EventHead);
+            EventHead = localHead;
+        } else {
+            EventHead = localHead;
+            EventTail = localTail;
+        }
+    }
+
     std::unique_ptr<IEventHandle> TMailbox::Pop() noexcept {
         if (!EventHead) {
             PreProcessEvents();
@@ -532,6 +557,39 @@ namespace NActors {
         PrependPreProcessed(ev, ev);
     }
 
+    ui64 TMailbox::DrainPending() noexcept {
+        ui64 drained = 0;
+        // Take the entire NextEventPtr stack via CAS, reverse it into
+        // FIFO order, and append to EventHead. Repeat until empty.
+        // We don't use PreProcessEvents() here because its loop
+        // stalls when NextEventPtr has exactly one item and EventHead
+        // is non-empty (it returns non-null without moving the item).
+        for (;;) {
+            uintptr_t current = NextEventPtr.load(std::memory_order_acquire);
+            if (current <= MarkerFree) {  // 0=locked, 1=unlocked, 2=free
+                break;
+            }
+            if (!NextEventPtr.compare_exchange_weak(current, 0, std::memory_order_acquire)) {
+                continue;
+            }
+            // Reverse the LIFO stack into FIFO order and count
+            IEventHandle* tail = reinterpret_cast<IEventHandle*>(current);
+            IEventHandle* head = tail;
+            IEventHandle* next = nullptr;
+            ui64 batchCount = 1;
+            while (IEventHandle* prev = GetNextPtr(head)) {
+                SetNextPtr(head, next);
+                next = head;
+                head = prev;
+                ++batchCount;
+            }
+            SetNextPtr(head, next);
+            AppendPreProcessed(head, tail);
+            drained += batchCount;
+        }
+        return drained;
+    }
+
     bool TMailbox::IsFree() const noexcept {
         return NextEventPtr.load(std::memory_order_relaxed) == MarkerFree;
     }
@@ -559,6 +617,11 @@ namespace NActors {
                 EventTail = newTail;
             }
         }
+    }
+
+    bool TMailbox::TryLockToFree() noexcept {
+        uintptr_t expected = 0;  // locked, no events
+        return NextEventPtr.compare_exchange_strong(expected, MarkerFree, std::memory_order_acquire);
     }
 
     void TMailbox::LockFromFree() noexcept {

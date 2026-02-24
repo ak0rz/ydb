@@ -131,7 +131,6 @@ namespace NActors::NWorkStealing {
                     mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
 
                     if (!processed) {
-                        // No event available. Finalize (unlock/free) the mailbox.
                         ctx->FinishMailbox(mailbox);
                         CurrentlyExecutingMailbox = nullptr;
 
@@ -166,6 +165,30 @@ namespace NActors::NWorkStealing {
                     if (target >= 0 && Driver_) {
                         Driver_->WakeSlot(&Slots_[target]);
                     }
+                };
+                callbacks.BeginBatch = [wsTable](ui32 hint) -> ui64 {
+                    // Drain pending events from NextEventPtr into EventHead.
+                    // Returns the count of drained events — used by PollSlot
+                    // to decide continuation eligibility. Single-event
+                    // activations (self-sends) skip the ring to prevent
+                    // monopolization.
+                    if (TMailbox* mailbox = wsTable->Get(hint)) {
+                        // Skip contended DrainPending if EventHead already has
+                        // preprocessed events. Pop() will call PreProcessEvents
+                        // on-demand when EventHead runs out. This avoids the
+                        // expensive CAS on NextEventPtr when many senders push
+                        // to the same mailbox concurrently.
+                        if (mailbox->EventHead) {
+                            // Return 2 to signal "has events" so PollSlot
+                            // routes to ring (preBatchCount > 1).
+                            return 2;
+                        }
+                        return mailbox->DrainPending();
+                    }
+                    return 0;
+                };
+                callbacks.EndBatch = [ctx](ui32 /*hint*/) {
+                    ctx->CommitLocalCursor();
                 };
                 callbacks.Setup = [ctx]() {
                     ctx->SetupTLS();
@@ -290,6 +313,9 @@ namespace NActors::NWorkStealing {
                     ScheduleActivation(mailbox);
                     return true;
                 case EMailboxPush::Free:
+                    Y_DEBUG_ABORT("WS Send: Push returned Free for hint=%" PRIu32 " recipient=%s",
+                        ev->GetRecipientRewrite().Hint(),
+                        ev->GetRecipientRewrite().ToString().c_str());
                     break;
             }
         }
@@ -315,6 +341,9 @@ namespace NActors::NWorkStealing {
                     SpecificScheduleActivation(mailbox);
                     return true;
                 case EMailboxPush::Free:
+                    Y_DEBUG_ABORT("WS SpecificSend: Push returned Free for hint=%" PRIu32 " recipient=%s",
+                        ev->GetRecipientRewrite().Hint(),
+                        ev->GetRecipientRewrite().ToString().c_str());
                     break;
             }
         }
@@ -451,8 +480,12 @@ namespace NActors::NWorkStealing {
 
         int slotIdx = Router_->Route(mailbox->Hint, mailbox->LastPoolSlotIdx);
 
+        if (slotIdx < 0) {
+            return;
+        }
+
         // Wake only the worker owning the target slot.
-        if (slotIdx >= 0 && Driver_) {
+        if (Driver_) {
             Driver_->WakeSlot(&Slots_[slotIdx]);
         }
     }
@@ -605,6 +638,37 @@ namespace NActors::NWorkStealing {
 
     uint64_t TWSExecutorPool::AdaptiveDeflateEvents() const {
         return AdaptiveScaler_ ? AdaptiveScaler_->DeflateEvents() : 0;
+    }
+
+    void TWSExecutorPool::DumpSlots(IOutputStream& out) const {
+        i16 active = ActiveSlotCount_.load(std::memory_order_relaxed);
+        out << "  pool=" << PoolName_ << " active=" << active << "/" << MaxSlotCount_ << Endl;
+        for (i16 i = 0; i < MaxSlotCount_; ++i) {
+            auto state = Slots_[i].GetState();
+            const char* stateStr = "???";
+            switch (state) {
+                case ESlotState::Inactive: stateStr = "Inactive"; break;
+                case ESlotState::Initializing: stateStr = "Initializing"; break;
+                case ESlotState::Active: stateStr = "Active"; break;
+                case ESlotState::Draining: stateStr = "Draining"; break;
+            }
+            int ringCount = Slots_[i].ContinuationCount.load(std::memory_order_relaxed);
+            out << "  slot[" << i << "]: state=" << stateStr
+                << " queue=" << Slots_[i].SizeEstimate()
+                << " ring=" << ringCount
+                << " spinning=" << Slots_[i].WorkerSpinning.load(std::memory_order_relaxed)
+                << " executing=" << Slots_[i].Executing.load(std::memory_order_relaxed);
+            if (ringCount > 0) {
+                out << " ring_items=[";
+                for (int j = 0; j < ringCount && j < 8; ++j) {
+                    if (j > 0) out << ",";
+                    out << Slots_[i].RingSnapshot[j].load(std::memory_order_relaxed);
+                }
+                out << "]";
+            }
+            // Per-slot watched-hint PollSlot tracing
+            out << Endl;
+        }
     }
 
 } // namespace NActors::NWorkStealing
