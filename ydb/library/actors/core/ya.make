@@ -131,6 +131,7 @@ END()
 RECURSE(
     harmonizer
     manual_test
+    ubench/system
 )
 
 RECURSE_FOR_TESTS(
