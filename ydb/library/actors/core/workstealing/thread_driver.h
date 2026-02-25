@@ -35,7 +35,7 @@ namespace NActors::NWorkStealing {
         void DeactivateSlot(TSlot* slot) override;
         void WakeSlot(TSlot* slot) override;
 
-        void SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) override;
+        void SetWorkerContext(TSlot* slot, TWSExecutorContext* ctx) override;
 
         std::unique_ptr<IStealIterator> MakeStealIterator(TSlot* exclude) override;
 
@@ -51,7 +51,7 @@ namespace NActors::NWorkStealing {
             ui16 WorkerIndex = 0;
             ui16 GroupIndex = 0;      // which slot group (pool) this worker belongs to
             TCpuId AssignedCpu = 0;   // CPU to pin to
-            TWorkerCallbacks Callbacks;
+            TWSExecutorContext* Ctx = nullptr;
         };
 
         struct TSlotGroup {

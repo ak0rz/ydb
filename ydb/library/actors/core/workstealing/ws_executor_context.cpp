@@ -1,6 +1,7 @@
 #include "ws_executor_context.h"
 #include "ws_bucket_map.h"
 #include "ws_mailbox_table.h"
+#include "ws_poll.h"
 
 #include <ydb/library/actors/core/actor.h>
 #include <ydb/library/actors/core/actor_class_stats.h>
@@ -20,6 +21,16 @@ namespace NActors::NWorkStealing {
     {
     }
 
+    TWSExecutorContext::~TWSExecutorContext() = default;
+
+    void TWSExecutorContext::SetStealIterator(std::unique_ptr<IStealIterator> iter) {
+        StealIterator_ = std::move(iter);
+    }
+
+    IStealIterator* TWSExecutorContext::GetStealIterator() const {
+        return StealIterator_.get();
+    }
+
     void TWSExecutorContext::SetupTLS() {
         ThreadCtx.ExecutionStats = &ExecutionStats;
         ThreadCtx.ActivityContext.ActorSystemIndex = ActorSystemIndex;
@@ -35,42 +46,11 @@ namespace NActors::NWorkStealing {
     }
 
     void TWSExecutorContext::CommitLocalCursor() {
-        if (LocalHead_ && CurrentBatchMailbox_) {
-            CurrentBatchMailbox_->ReattachEventChain(LocalHead_, LocalTail_);
-            LocalHead_ = nullptr;
-            LocalTail_ = nullptr;
-        }
-        CurrentBatchMailbox_ = nullptr;
+        // No-op: Vyukov MPSC queue doesn't need local cursor management.
+        // Head is updated by Pop() directly (no false-sharing with Tail).
     }
 
-    bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
-        // Pop from local cursor to avoid writing mailbox->EventHead per event.
-        // EventHead shares a cache line with NextEventPtr (producer CAS target);
-        // writing it on every Pop causes false sharing under high sender count.
-        if (!LocalHead_) {
-            // Local cursor exhausted — refill from mailbox
-            LocalHead_ = mailbox->DrainToLocal(LocalTail_);
-            CurrentBatchMailbox_ = mailbox;
-        }
-
-        IEventHandle* rawEv = LocalHead_;
-        if (rawEv) {
-            LocalHead_ = reinterpret_cast<IEventHandle*>(
-                rawEv->NextLinkPtr.load(std::memory_order_relaxed));
-            rawEv->NextLinkPtr.store(0, std::memory_order_relaxed);
-            if (!LocalHead_) {
-                LocalTail_ = nullptr;
-            }
-        }
-
-        if (!rawEv) {
-            LocalTail_ = nullptr;
-            CurrentBatchMailbox_ = nullptr;
-            return false;
-        }
-
-        std::unique_ptr<IEventHandle> ev(rawEv);
-
+    void TWSExecutorContext::DispatchEvent(TMailbox* mailbox, std::unique_ptr<IEventHandle> ev, NHPTimer::STime& hpnow) {
         NHPTimer::STime hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
         ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
 
@@ -111,7 +91,7 @@ namespace NActors::NWorkStealing {
                 Accum_.ClassCycles += (hpnow - hpprev);
             }
 
-            // Accumulate mailbox stats locally; flushed in FinishMailbox
+            // Accumulate mailbox stats locally; flushed in FinalizeActivation
             if (!Accum_.MboxStats) {
                 Accum_.MboxStats = WsMailboxTable_
                     ? WsMailboxTable_->GetStats(mailbox->Hint) : nullptr;
@@ -137,10 +117,6 @@ namespace NActors::NWorkStealing {
                 actor = nullptr;
             }
 
-            if (mailbox->IsEmpty()) {
-                mailbox->LockToFree();
-            }
-
             ExecutionStats.AddElapsedCycles(activityType, hpnow - hpprev);
             NHPTimer::STime elapsed = hpnow - hpprev;
             mailbox->AddElapsedCycles(elapsed);
@@ -163,8 +139,73 @@ namespace NActors::NWorkStealing {
 
         TlsActivationContext = nullptr;
         NProfiling::TMemoryTagScope::Reset(0);
+    }
 
+    bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
+        std::unique_ptr<IEventHandle> ev = mailbox->Pop();
+        if (!ev) {
+            return false;
+        }
+        DispatchEvent(mailbox, std::move(ev), hpnow);
+        if (mailbox->IsEmpty()) {
+            mailbox->LockToFree();
+        }
         return true;
+    }
+
+    TWSExecutorContext::TActivationResult TWSExecutorContext::ExecuteActivation(
+        TMailbox* mailbox, ui32 eventBudget, NHPTimer::STime deadline, NHPTimer::STime& hpnow)
+    {
+        TActivationResult result;
+        NHPTimer::STime hpBefore = hpnow;
+        ESnapshotResult snapshotResult;
+        {
+            TMailboxSnapshot snapshot(mailbox, snapshotResult);
+            while (eventBudget > 0) {
+                auto ev = snapshot.Pop();
+                if (!ev) break;
+                DispatchEvent(mailbox, std::move(ev), hpnow);
+                --eventBudget;
+                ++result.EventsProcessed;
+                if (mailbox->IsEmpty()) break;
+                if (hpnow >= deadline) break;
+            }
+        }
+
+        // Update bucket stats with total activation cost
+        if (BucketMap_ && result.EventsProcessed > 0) {
+            uint64_t totalCycles = static_cast<uint64_t>(hpnow - hpBefore);
+            BucketMap_->UpdateAfterExecution(mailbox->Hint, totalCycles);
+        }
+
+        return result;
+    }
+
+    bool TWSExecutorContext::FinalizeActivation(TMailbox* mailbox, i16 slotIdx, NHPTimer::STime hpnow) {
+        FlushAllStats(hpnow);
+        TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
+        TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
+
+        // Stamp affinity before any state transition — after unlock/free
+        // another thread may read LastPoolSlotIdx via RouteActivation.
+        mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
+
+        if (mailbox->IsFree()) {
+            if (SlotAllocator_) {
+                SlotAllocator_->Free(mailbox->Hint);
+            }
+            return true;
+        }
+
+        if (mailbox->IsEmpty()) {
+            mailbox->LockToFree();
+            if (SlotAllocator_) {
+                SlotAllocator_->Free(mailbox->Hint);
+            }
+            return true;
+        }
+
+        return mailbox->TryUnlock();
     }
 
     void TWSExecutorContext::FlushClassStats() {
@@ -223,12 +264,9 @@ namespace NActors::NWorkStealing {
         }
 
         // Reclaim empty mailboxes (last actor called PassAway).
-        // Check: no actors, no pre-processed events in EventHead.
-        // TryLockToFree uses CAS (0 → MarkerFree), so it fails safely
-        // if a concurrent Push arrived — we fall through to Unlock.
-        if (mailbox->IsEmpty() && !mailbox->EventHead
-                && mailbox->TryLockToFree())
-        {
+        // TryLockToFree checks Head==StubPtr, Stub==0, and CAS on Tail,
+        // so it fails safely if a concurrent Push arrived.
+        if (mailbox->IsEmpty() && mailbox->CanReclaim()) {
             if (SlotAllocator_) {
                 SlotAllocator_->Free(mailbox->Hint);
             }

@@ -13,18 +13,10 @@
 
 namespace NActors::NWorkStealing {
 
-    // Deferred re-injection mechanism.
-    //
-    // When Execute() calls mailbox->Unlock() and TryUnlock fails (events were
-    // pushed during execution), Unlock calls pool->ScheduleActivationEx() to
-    // re-inject the hint. Without deferral, the hint enters another slot's
-    // queue while the first worker is still inside Execute(). Another worker
-    // can then drain+pop+execute the same mailbox concurrently — crash.
-    //
-    // Fix: only defer ScheduleActivationEx for the CURRENTLY EXECUTING mailbox.
-    // Other mailboxes (activated by Send during Receive) are routed immediately.
-    static thread_local TMailbox* CurrentlyExecutingMailbox = nullptr;
-    static thread_local TMailbox* DeferredReinjection = nullptr;
+    // Note: the old deferred re-injection mechanism (CurrentlyExecutingMailbox /
+    // DeferredReinjection) is no longer needed. PollSlot now handles mailbox
+    // lifecycle via TMailboxSnapshot + FinalizeActivation without calling
+    // Unlock/ScheduleActivationEx for the currently executing mailbox.
 
 
     TWSExecutorPool* TWSExecutorPool::LastCreated = nullptr;
@@ -106,56 +98,13 @@ namespace NActors::NWorkStealing {
             Slots_[i].WsMailboxTable = wsTable;
         }
 
-        // Register all slots with the driver and wire per-worker callbacks
+        // Register all slots with the driver and wire slot fields + contexts
         if (Driver_) {
             Driver_->RegisterSlots(Slots_.data(), static_cast<size_t>(MaxSlotCount_));
-            auto* pool = this;
             for (i16 i = 0; i < MaxSlotCount_; ++i) {
-                auto* ctx = Contexts_[i].get();
-                TWorkerCallbacks callbacks;
-                i16 slotIdx = i;
-                callbacks.Execute = [ctx, wsTable, pool, slotIdx](ui32 hint, NHPTimer::STime& hpnow) -> bool {
-                    TMailbox* mailbox = wsTable->Get(hint);
-                    if (!mailbox) {
-                        return false;
-                    }
-
-                    CurrentlyExecutingMailbox = mailbox;
-                    DeferredReinjection = nullptr;
-
-                    NHPTimer::STime hpBefore = hpnow;
-                    bool processed = ctx->ExecuteSingleEvent(mailbox, hpnow);
-
-                    // Stamp affinity BEFORE any unlock — after unlock another
-                    // thread may read LastPoolSlotIdx via RouteActivation.
-                    mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
-
-                    if (!processed) {
-                        ctx->FinishMailbox(mailbox);
-                        CurrentlyExecutingMailbox = nullptr;
-
-                        // Process deferred re-activation from Unlock path.
-                        if (DeferredReinjection) {
-                            TMailbox* deferred = DeferredReinjection;
-                            DeferredReinjection = nullptr;
-                            pool->RouteActivation(deferred);
-                        }
-                        return false;
-                    }
-
-                    // Inline bucket eviction: update bucket stats after each event
-                    if (pool->BucketMap_) {
-                        uint64_t eventCycles = static_cast<uint64_t>(hpnow - hpBefore);
-                        pool->BucketMap_->UpdateAfterExecution(hint, eventCycles);
-                    }
-
-                    // Event processed, mailbox stays locked for more.
-                    mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
-                    CurrentlyExecutingMailbox = nullptr;
-                    DeferredReinjection = nullptr;
-                    return true;
-                };
-                callbacks.Overflow = [this, wsTable](ui32 hint) {
+                Slots_[i].SlotIdx = i;
+                Slots_[i].Config = &WsConfig_;
+                Slots_[i].Overflow = [this, wsTable](ui32 hint) {
                     // Reset sticky routing — this activation is being load-shed
                     if (auto* mailbox = wsTable->Get(hint)) {
                         mailbox->LastPoolSlotIdx = 0;
@@ -166,44 +115,14 @@ namespace NActors::NWorkStealing {
                         Driver_->WakeSlot(&Slots_[target]);
                     }
                 };
-                callbacks.BeginBatch = [wsTable](ui32 hint) -> ui64 {
-                    // Drain pending events from NextEventPtr into EventHead.
-                    // Returns the count of drained events — used by PollSlot
-                    // to decide continuation eligibility. Single-event
-                    // activations (self-sends) skip the ring to prevent
-                    // monopolization.
-                    if (TMailbox* mailbox = wsTable->Get(hint)) {
-                        // Skip contended DrainPending if EventHead already has
-                        // preprocessed events. Pop() will call PreProcessEvents
-                        // on-demand when EventHead runs out. This avoids the
-                        // expensive CAS on NextEventPtr when many senders push
-                        // to the same mailbox concurrently.
-                        if (mailbox->EventHead) {
-                            // Return 2 to signal "has events" so PollSlot
-                            // routes to ring (preBatchCount > 1).
-                            return 2;
-                        }
-                        return mailbox->DrainPending();
-                    }
-                    return 0;
-                };
-                callbacks.EndBatch = [ctx](ui32 /*hint*/) {
-                    ctx->CommitLocalCursor();
-                };
-                callbacks.Setup = [ctx]() {
-                    ctx->SetupTLS();
-                };
-                callbacks.Teardown = [ctx]() {
-                    ctx->ClearTLS();
-                };
                 if (i == 0 && WsConfig_.AdaptiveScaling) {
-                    callbacks.AdaptiveEval = [this]() {
+                    Slots_[i].AdaptiveEval = [this]() {
                         if (AdaptiveScaler_) {
                             AdaptiveScaler_->Evaluate();
                         }
                     };
                 }
-                Driver_->SetWorkerCallbacks(&Slots_[i], std::move(callbacks));
+                Driver_->SetWorkerContext(&Slots_[i], Contexts_[i].get());
             }
 
             // Activate default number of slots
@@ -437,12 +356,6 @@ namespace NActors::NWorkStealing {
     }
 
     void TWSExecutorPool::ScheduleActivationEx(TMailbox* mailbox, ui64 /*revolvingCounter*/) {
-        if (mailbox == CurrentlyExecutingMailbox) {
-            // Called from inside Execute → Unlock → TryUnlock failed.
-            // Defer re-injection until Execute returns to prevent concurrent execution.
-            DeferredReinjection = mailbox;
-            return;
-        }
         RouteActivation(mailbox);
     }
 

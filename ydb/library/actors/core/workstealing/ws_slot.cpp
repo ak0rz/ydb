@@ -1,9 +1,30 @@
 #include "ws_slot.h"
+#include "ws_config.h"
 #include "ws_mailbox_table.h"
 
 #include <util/system/yassert.h>
 
 namespace NActors::NWorkStealing {
+
+    // --- TContinuationRing (needs complete TSlot) ---
+
+    void TContinuationRing::FlushTo(TSlot& slot) {
+        while (!Empty()) {
+            slot.Push(*Pop());
+        }
+    }
+
+    void TContinuationRing::SnapshotTo(TSlot& slot) const {
+        for (uint8_t i = 0; i < Count; ++i) {
+            slot.RingSnapshot[i].store(Items[(Head + i) % kMaxCapacity],
+                                       std::memory_order_relaxed);
+        }
+        for (uint8_t i = Count; i < kMaxCapacity; ++i) {
+            slot.RingSnapshot[i].store(0, std::memory_order_relaxed);
+        }
+    }
+
+    // --- TSlot ---
 
     TSlot::TSlot() = default;
 
@@ -93,6 +114,30 @@ namespace NActors::NWorkStealing {
     size_t TSlot::SizeEstimate() const {
         i64 size = ApproxSize_.load(std::memory_order_relaxed);
         return (size > 0) ? static_cast<size_t>(size) : 0;
+    }
+
+    void TSlot::AcquireForWorker() {
+        PollState_ = TPollState{};
+        if (Config) {
+            PollState_.Ring.Capacity = Config->ContinuationRingCapacity;
+        }
+        WorkerSpinning.store(true, std::memory_order_release);
+    }
+
+    void TSlot::ReleaseFromWorker() {
+        if (!PollState_.Ring.Empty()) {
+            PollState_.Ring.FlushTo(*this);
+        }
+        ContinuationCount.store(0, std::memory_order_relaxed);
+        WorkerSpinning.store(false, std::memory_order_seq_cst);
+        PollState_ = TPollState{};
+    }
+
+    void TSlot::FlushRing() {
+        if (!PollState_.Ring.Empty()) {
+            PollState_.Ring.FlushTo(*this);
+            ContinuationCount.store(0, std::memory_order_relaxed);
+        }
     }
 
 } // namespace NActors::NWorkStealing

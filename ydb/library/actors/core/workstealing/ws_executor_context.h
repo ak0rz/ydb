@@ -3,6 +3,8 @@
 #include <ydb/library/actors/core/executor_thread.h>
 #include <ydb/library/actors/util/datetime.h>
 
+#include <memory>
+
 namespace NActors {
     class TMailbox;
     struct TActorClassStats;
@@ -11,6 +13,7 @@ namespace NActors {
 namespace NActors::NWorkStealing {
 
     class TBucketMap;
+    class IStealIterator;
     struct TMailboxExecStats;
     class TWsMailboxTable;
     class TWsSlotAllocator;
@@ -33,6 +36,8 @@ namespace NActors::NWorkStealing {
             TWorkerId workerId,
             TActorSystem* actorSystem,
             IExecutorPool* pool);
+
+        ~TWSExecutorContext();
 
         // Access the thread context for TLS setup
         TThreadContext& GetThreadCtx() {
@@ -64,13 +69,39 @@ namespace NActors::NWorkStealing {
         void SetWsMailboxTable(TWsMailboxTable* table) { WsMailboxTable_ = table; }
         void SetSlotAllocator(TWsSlotAllocator* alloc) { SlotAllocator_ = alloc; }
 
+        void SetStealIterator(std::unique_ptr<IStealIterator> iter);
+        IStealIterator* GetStealIterator() const;
+
         // Commit any remaining local cursor events back to the mailbox's EventHead.
         // Called by EndBatch callback after each activation batch.
         void CommitLocalCursor();
 
+        // Result of a snapshot-based activation batch.
+        struct TActivationResult {
+            ui32 EventsProcessed = 0;
+        };
+
+        // Execute a mailbox activation batch using TMailboxSnapshot.
+        // Creates a snapshot of the mailbox queue and dispatches events until
+        // eventBudget, deadline, or queue exhaustion (whichever comes first).
+        // Does NOT finalize the mailbox — call FinalizeActivation after.
+        TActivationResult ExecuteActivation(
+            TMailbox* mailbox,
+            ui32 eventBudget,
+            NHPTimer::STime deadline,
+            NHPTimer::STime& hpnow);
+
+        // Finalize a mailbox after an activation batch. Flushes accumulated
+        // stats, stamps slot affinity, and handles dead mailboxes (IsEmpty →
+        // LockToFree + hint reclamation). Tries TryUnlock for idle transition.
+        // Returns true if the mailbox is done (freed or went idle).
+        // Returns false if the mailbox needs rescheduling (events remain).
+        bool FinalizeActivation(TMailbox* mailbox, i16 slotIdx, NHPTimer::STime hpnow);
+
         // Do NOT start the thread.
         // TThread::Start() is never called.
     private:
+        void DispatchEvent(TMailbox* mailbox, std::unique_ptr<IEventHandle> ev, NHPTimer::STime& hpnow);
         // Batch accumulator for per-event stats.
         // Eliminates atomic operations on the hot path by accumulating
         // stats in plain variables and flushing once per mailbox batch.
@@ -105,15 +136,8 @@ namespace NActors::NWorkStealing {
         TBucketMap* BucketMap_ = nullptr;
         TWsMailboxTable* WsMailboxTable_ = nullptr;
         TWsSlotAllocator* SlotAllocator_ = nullptr;
+        std::unique_ptr<IStealIterator> StealIterator_;
         TStatsAccumulator Accum_;
-
-        // Local batch cursor — avoids writing mailbox->EventHead on every Pop.
-        // EventHead shares a cache line with NextEventPtr (producer CAS target).
-        // By reading events from a local pointer, we eliminate false-sharing
-        // between senders (CAS on NextEventPtr) and the receiver (read EventHead).
-        IEventHandle* LocalHead_ = nullptr;
-        IEventHandle* LocalTail_ = nullptr;
-        TMailbox* CurrentBatchMailbox_ = nullptr;
     };
 
 } // namespace NActors::NWorkStealing

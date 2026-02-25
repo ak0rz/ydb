@@ -1,5 +1,6 @@
 #include "thread_driver.h"
 #include "ws_bucket_map.h"
+#include "ws_executor_context.h"
 
 #include <ydb/library/actors/util/affinity.h>
 #include <ydb/library/actors/util/datetime.h>
@@ -268,10 +269,10 @@ namespace NActors::NWorkStealing {
         return std::make_unique<TTopologyStealIterator>(std::move(groupSlots), Config_.MaxStealNeighbors);
     }
 
-    void TThreadDriver::SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) {
+    void TThreadDriver::SetWorkerContext(TSlot* slot, TWSExecutorContext* ctx) {
         auto* worker = static_cast<TWorker*>(slot->DriverData);
         if (worker) {
-            worker->Callbacks = std::move(callbacks);
+            worker->Ctx = ctx;
         }
     }
 
@@ -282,28 +283,36 @@ namespace NActors::NWorkStealing {
             affinity.Set();
         }
 
-        if (worker.Callbacks.Setup) {
-            worker.Callbacks.Setup();
+        if (worker.Ctx) {
+            worker.Ctx->SetStealIterator(MakeStealIterator(worker.Slot));
+            worker.Ctx->SetupTLS();
         }
 
-        auto stealIterator = MakeStealIterator(worker.Slot);
-        TPollState pollState;
-        pollState.Ring.Capacity = Config_.ContinuationRingCapacity;
+        // Poll helper: dispatches to the production or test overload
+        // depending on whether a TWSExecutorContext is available.
+        auto doPoll = [&]() -> EPollResult {
+            if (worker.Ctx) {
+                return PollSlot(*worker.Slot, *worker.Ctx);
+            }
+            return PollSlot(*worker.Slot);
+        };
+
         ui64 lastLocalWorkTs = GetCycleCountFast();
         ui64 lastAdaptiveEvalTs = lastLocalWorkTs;
         // Adaptive spin: start with short threshold after wake, extend to full
         // threshold once the slot proves it has steady local work.
         ui64 spinThreshold = Config_.MinSpinThresholdCycles;
 
-        worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+        worker.Slot->AcquireForWorker();
 
         while (!worker.ShouldStop.load(std::memory_order_acquire)) {
             ESlotState slotState = worker.Slot->GetState();
 
             if (slotState == ESlotState::Draining) {
                 // Drain remaining activations without stealing — slot is winding down.
+                // PollSlot skips stealing when the slot is Draining.
                 ui64 pollStartTs = GetCycleCountFast();
-                EPollResult result = PollSlot(*worker.Slot, nullptr, worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState, worker.Callbacks.BeginBatch, worker.Callbacks.EndBatch);
+                EPollResult result = doPoll();
                 ui64 pollElapsed = GetCycleCountFast() - pollStartTs;
                 if (result == EPollResult::Busy) {
                     worker.Slot->Stats.BusyCycles.fetch_add(pollElapsed, std::memory_order_relaxed);
@@ -314,18 +323,17 @@ namespace NActors::NWorkStealing {
 
                 // Flush ring before Dekker check — locked mailboxes
                 // must be visible in the queue before we announce not-spinning.
-                if (!pollState.Ring.Empty()) {
-                    pollState.Ring.FlushTo(*worker.Slot);
-                    worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
+                if (!worker.Slot->GetPollState().Ring.Empty()) {
+                    worker.Slot->FlushRing();
                     continue;  // re-enter loop to process flushed items
                 }
 
                 // Queue appears empty. Dekker: announce not-spinning, re-check
                 // for items from in-flight Route() calls that saw Active before
                 // the transition.
-                worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
+                worker.Slot->ReleaseFromWorker();
                 if (worker.Slot->HasWork()) {
-                    worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                    worker.Slot->AcquireForWorker();
                     continue;
                 }
 
@@ -338,8 +346,8 @@ namespace NActors::NWorkStealing {
                 // event but does not reschedule the activation if the mailbox has
                 // more events, leading to stalled mailboxes.
                 while (auto item = worker.Slot->Pop()) {
-                    if (worker.Callbacks.Overflow) {
-                        worker.Callbacks.Overflow(*item);
+                    if (worker.Slot->Overflow) {
+                        worker.Slot->Overflow(*item);
                     }
                 }
 
@@ -349,7 +357,7 @@ namespace NActors::NWorkStealing {
                     worker.Slot->Stats.IdleCycles.fetch_add(
                         GetCycleCountFast() - parkStart, std::memory_order_relaxed);
                 }
-                worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                worker.Slot->AcquireForWorker();
                 if (worker.ShouldStop.load(std::memory_order_acquire)) {
                     break;
                 }
@@ -360,14 +368,14 @@ namespace NActors::NWorkStealing {
 
             if (slotState != ESlotState::Active) {
                 // Inactive or Initializing — park and wait for activation.
-                worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
+                worker.Slot->ReleaseFromWorker();
                 {
                     ui64 parkStart = GetCycleCountFast();
                     worker.ParkPad.Park();
                     worker.Slot->Stats.IdleCycles.fetch_add(
                         GetCycleCountFast() - parkStart, std::memory_order_relaxed);
                 }
-                worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                worker.Slot->AcquireForWorker();
                 if (worker.ShouldStop.load(std::memory_order_acquire)) {
                     break;
                 }
@@ -377,7 +385,7 @@ namespace NActors::NWorkStealing {
             }
 
             ui64 pollStartTs = GetCycleCountFast();
-            EPollResult result = PollSlot(*worker.Slot, stealIterator.get(), worker.Callbacks.Execute, worker.Callbacks.Overflow, Config_, pollState, worker.Callbacks.BeginBatch, worker.Callbacks.EndBatch);
+            EPollResult result = doPoll();
             ui64 pollElapsed = GetCycleCountFast() - pollStartTs;
 
             if (result == EPollResult::Busy) {
@@ -386,15 +394,15 @@ namespace NActors::NWorkStealing {
                 worker.Slot->Stats.IdleCycles.fetch_add(pollElapsed, std::memory_order_relaxed);
             }
 
-            if (worker.Callbacks.AdaptiveEval) {
+            if (worker.Slot->AdaptiveEval) {
                 ui64 now = GetCycleCountFast();
                 if (now - lastAdaptiveEvalTs > Config_.AdaptiveEvalCycles) {
                     lastAdaptiveEvalTs = now;
-                    worker.Callbacks.AdaptiveEval();
+                    worker.Slot->AdaptiveEval();
                 }
             }
 
-            if (pollState.HadLocalWork) {
+            if (worker.Slot->GetPollState().HadLocalWork) {
                 lastLocalWorkTs = GetCycleCountFast();
                 // Local work found — earn full spin time
                 spinThreshold = Config_.SpinThresholdCycles;
@@ -408,26 +416,20 @@ namespace NActors::NWorkStealing {
             // Check on both Idle and stolen-Busy to ensure workers that keep
             // stealing but have no local work eventually park.
             if (result == EPollResult::Idle ||
-                (result == EPollResult::Busy && !pollState.HadLocalWork))
+                (result == EPollResult::Busy && !worker.Slot->GetPollState().HadLocalWork))
             {
                 ui64 now = GetCycleCountFast();
                 if (now - lastLocalWorkTs > spinThreshold) {
-                    // Flush ring before parking — push locked mailboxes to the
-                    // queue so they're visible to WakeSlot's HasWork() check.
-                    if (!pollState.Ring.Empty()) {
-                        pollState.Ring.FlushTo(*worker.Slot);
-                        worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
-                    }
-
-                    // Dekker protocol: announce intent to park, then re-check.
+                    // Dekker protocol: release flushes ring and sets
+                    // WorkerSpinning=false (seq_cst). Then re-check for work.
                     // Paired with seq_cst load in WakeSlot. Either:
                     //  - WakeSlot sees WorkerSpinning=false → calls Unpark
                     //  - We see the injection → skip park
-                    worker.Slot->WorkerSpinning.store(false, std::memory_order_seq_cst);
+                    worker.Slot->ReleaseFromWorker();
 
                     if (worker.Slot->HasWork()) {
                         // Work arrived between last poll and now — don't park
-                        worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                        worker.Slot->AcquireForWorker();
                         lastLocalWorkTs = GetCycleCountFast();
                         spinThreshold = Config_.MinSpinThresholdCycles;
                         continue;
@@ -436,7 +438,7 @@ namespace NActors::NWorkStealing {
                     worker.Slot->Counters.Parks.fetch_add(1, std::memory_order_relaxed);
                     {
                         ui64 parkStart = GetCycleCountFast();
-                        if (worker.Callbacks.AdaptiveEval) {
+                        if (worker.Slot->AdaptiveEval) {
                             // Worker 0 with adaptive scaling: timed sleep instead of
                             // indefinite park, so AdaptiveEval fires periodically.
                             NanoSleep(Config_.AdaptiveParkNs);
@@ -446,27 +448,20 @@ namespace NActors::NWorkStealing {
                         worker.Slot->Stats.IdleCycles.fetch_add(
                             GetCycleCountFast() - parkStart, std::memory_order_relaxed);
                     }
-                    worker.Slot->WorkerSpinning.store(true, std::memory_order_release);
+                    worker.Slot->AcquireForWorker();
                     if (worker.ShouldStop.load(std::memory_order_acquire)) {
                         break;
                     }
-                    pollState = TPollState{};
                     lastLocalWorkTs = GetCycleCountFast();
                     spinThreshold = Config_.MinSpinThresholdCycles;
                 }
             }
         }
 
-        // Flush any remaining ring items before shutdown.
-        if (!pollState.Ring.Empty()) {
-            pollState.Ring.FlushTo(*worker.Slot);
-            worker.Slot->ContinuationCount.store(0, std::memory_order_relaxed);
-        }
+        worker.Slot->ReleaseFromWorker();
 
-        worker.Slot->WorkerSpinning.store(false, std::memory_order_release);
-
-        if (worker.Callbacks.Teardown) {
-            worker.Callbacks.Teardown();
+        if (worker.Ctx) {
+            worker.Ctx->ClearTLS();
         }
     }
 

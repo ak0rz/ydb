@@ -56,7 +56,7 @@ namespace NActors::NWorkStealing {
             void WakeSlot(TSlot* /*slot*/) override {
                 WakeCount++;
             }
-            void SetWorkerCallbacks(TSlot* /*slot*/, TWorkerCallbacks /*callbacks*/) override {
+            void SetWorkerContext(TSlot* /*slot*/, TWSExecutorContext* /*ctx*/) override {
             }
             std::unique_ptr<IStealIterator> MakeStealIterator(TSlot* /*exclude*/) override {
                 return nullptr;

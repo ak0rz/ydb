@@ -9,13 +9,6 @@
 
 namespace NActors::NWorkStealing {
 
-    // Helper: set a simple execute callback on a slot
-    static void SetSimpleCallback(TThreadDriver& driver, TSlot& slot, TExecuteCallback execute) {
-        TWorkerCallbacks callbacks;
-        callbacks.Execute = std::move(execute);
-        driver.SetWorkerCallbacks(&slot, std::move(callbacks));
-    }
-
     Y_UNIT_TEST_SUITE(ThreadDriver) {
 
         Y_UNIT_TEST(CreateAndDestroy) {
@@ -36,7 +29,6 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            SetSimpleCallback(driver, slot, [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slot);
@@ -48,7 +40,7 @@ namespace NActors::NWorkStealing {
             driver.Shutdown();
         }
 
-        Y_UNIT_TEST(WorkerExecutesActivation) {
+        Y_UNIT_TEST(WorkerProcessesActivation) {
             TWsConfig config;
             config.SpinThresholdCycles = 1000000; // high threshold to keep worker spinning
             TThreadDriver driver(config);
@@ -58,31 +50,27 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            std::atomic<int> counter{0};
-            SetSimpleCallback(driver, slot, [&counter](ui32, NHPTimer::STime&) -> bool {
-                counter.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            });
-
             driver.Start();
             driver.ActivateSlot(&slot);
 
             // Give the worker time to start polling
             Sleep(TDuration::MilliSeconds(50));
 
-            // Inject an activation and wake the worker (it may have parked)
+            // Inject an activation and wake the worker (it may have parked).
+            // With null ctx, PollSlot pops the hint but skips execution.
+            // The item is consumed (not re-queued), verifying the poll loop runs.
             slot.Push(42);
             driver.WakeSlot(&slot);
 
-            // Wait for worker to process it
+            // Wait for worker to consume it
             for (int i = 0; i < 100; ++i) {
-                if (counter.load(std::memory_order_relaxed) > 0) {
+                if (slot.SizeEstimate() == 0) {
                     break;
                 }
                 Sleep(TDuration::MilliSeconds(10));
             }
 
-            UNIT_ASSERT_GE(counter.load(std::memory_order_relaxed), 1);
+            UNIT_ASSERT_EQUAL(slot.SizeEstimate(), 0);
 
             driver.PrepareStop();
             driver.Shutdown();
@@ -97,7 +85,6 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            SetSimpleCallback(driver, slot, [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slot);
@@ -167,8 +154,6 @@ namespace NActors::NWorkStealing {
             TSlot slots[2];
             driver.RegisterSlots(slots, 2);
 
-            SetSimpleCallback(driver, slots[0], [](ui32, NHPTimer::STime&) -> bool { return false; });
-            SetSimpleCallback(driver, slots[1], [](ui32, NHPTimer::STime&) -> bool { return false; });
             driver.Start();
 
             driver.ActivateSlot(&slots[0]);
@@ -190,12 +175,6 @@ namespace NActors::NWorkStealing {
             TSlot slot;
             driver.RegisterSlots(&slot, 1);
 
-            std::atomic<int> counter{0};
-            SetSimpleCallback(driver, slot, [&counter](ui32, NHPTimer::STime&) -> bool {
-                counter.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            });
-
             driver.Start();
             driver.ActivateSlot(&slot);
 
@@ -206,51 +185,18 @@ namespace NActors::NWorkStealing {
             slot.Push(99);
             driver.WakeSlot(&slot);
 
-            // Wait for the worker to process
+            // Wait for the worker to consume the activation
             for (int i = 0; i < 100; ++i) {
-                if (counter.load(std::memory_order_relaxed) > 0) {
+                if (slot.SizeEstimate() == 0) {
                     break;
                 }
                 Sleep(TDuration::MilliSeconds(10));
             }
 
-            UNIT_ASSERT_GE(counter.load(std::memory_order_relaxed), 1);
+            UNIT_ASSERT_EQUAL(slot.SizeEstimate(), 0);
 
             driver.PrepareStop();
             driver.Shutdown();
-        }
-
-        Y_UNIT_TEST(SetupAndTeardownCalled) {
-            TWsConfig config;
-            TThreadDriver driver(config);
-            auto topology = TCpuTopology::MakeFlat(4);
-            driver.Prepare(topology);
-
-            TSlot slot;
-            driver.RegisterSlots(&slot, 1);
-
-            std::atomic<bool> setupCalled{false};
-            std::atomic<bool> teardownCalled{false};
-            TWorkerCallbacks callbacks;
-            callbacks.Execute = [](ui32, NHPTimer::STime&) -> bool { return false; };
-            callbacks.Setup = [&setupCalled]() {
-                setupCalled.store(true, std::memory_order_relaxed);
-            };
-            callbacks.Teardown = [&teardownCalled]() {
-                teardownCalled.store(true, std::memory_order_relaxed);
-            };
-            driver.SetWorkerCallbacks(&slot, std::move(callbacks));
-
-            driver.ActivateSlot(&slot);
-            driver.Start();
-            Sleep(TDuration::MilliSeconds(50));
-
-            UNIT_ASSERT(setupCalled.load(std::memory_order_relaxed));
-
-            driver.PrepareStop();
-            driver.Shutdown();
-
-            UNIT_ASSERT(teardownCalled.load(std::memory_order_relaxed));
         }
 
     } // Y_UNIT_TEST_SUITE(ThreadDriver)

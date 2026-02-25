@@ -1,24 +1,14 @@
 #pragma once
 
 #include "ws_slot.h"
-#include "ws_poll.h"
 #include "topology.h"
 
-#include <functional>
 #include <memory>
 
 namespace NActors::NWorkStealing {
 
-    // Callbacks provided by the pool per worker slot.
-    struct TWorkerCallbacks {
-        TExecuteCallback Execute;       // Called per activation (ui32 hint -> bool preempted)
-        TOverflowCallback Overflow;     // Ring overflow → reroute activation to another slot
-        TBeginBatchCallback BeginBatch; // Called before each activation batch (drain pending events)
-        TEndBatchCallback EndBatch;     // Called after each activation batch (commit local cursor)
-        std::function<void()> Setup;    // Called once at worker thread start (TLS setup)
-        std::function<void()> Teardown; // Called once at worker thread end (TLS cleanup)
-        std::function<void()> AdaptiveEval; // Periodic eval from worker 0 (adaptive scaling)
-    };
+    class IStealIterator;
+    class TWSExecutorContext;
 
     // Abstract driver interface. Owns system-wide workers pinned to CPUs.
     // Decouples thread management from executor pools.
@@ -38,8 +28,8 @@ namespace NActors::NWorkStealing {
         virtual void DeactivateSlot(TSlot* slot) = 0; // harmonizer deflates
         virtual void WakeSlot(TSlot* slot) = 0;       // wake the worker owning this slot
 
-        // Set per-worker callbacks for a slot. Called by the pool after RegisterSlot.
-        virtual void SetWorkerCallbacks(TSlot* slot, TWorkerCallbacks callbacks) = 0;
+        // Set executor context for a worker. Called by the pool after RegisterSlots.
+        virtual void SetWorkerContext(TSlot* slot, TWSExecutorContext* ctx) = 0;
 
         // Create a steal iterator for a worker, excluding the given slot
         virtual std::unique_ptr<IStealIterator> MakeStealIterator(TSlot* exclude) = 0;
