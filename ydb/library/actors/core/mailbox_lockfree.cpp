@@ -5,16 +5,12 @@
 namespace NActors {
 
     namespace {
-        static inline IEventHandle* GetNextPtr(IEventHandle* ev) {
-            return reinterpret_cast<IEventHandle*>(ev->NextLinkPtr.load(std::memory_order_relaxed));
+        static inline IEventHandle* GetNextPtrAcquire(IEventHandle* ev) {
+            return reinterpret_cast<IEventHandle*>(ev->NextLinkPtr.load(std::memory_order_acquire));
         }
 
         static inline void SetNextPtr(IEventHandle* ev, IEventHandle* next) {
             ev->NextLinkPtr.store(reinterpret_cast<uintptr_t>(next), std::memory_order_relaxed);
-        }
-
-        static inline void SetNextPtr(IEventHandle* ev, uintptr_t next) {
-            ev->NextLinkPtr.store(next, std::memory_order_relaxed);
         }
     }
 
@@ -326,27 +322,34 @@ namespace NActors {
     bool TMailbox::CleanupEvents() noexcept {
         bool hadEvents = false;
 
-        // Note: new events cannot be added after this mailbox is marked free
-        uintptr_t current = NextEventPtr.exchange(MarkerFree, std::memory_order_acquire);
-        if (current && current != MarkerUnlocked && current != MarkerFree) {
-            IEventHandle* top = reinterpret_cast<IEventHandle*>(current);
-            do {
-                IEventHandle* ev = top;
-                top = GetNextPtr(ev);
+        // Set free state so new pushes return Free
+        State.store(EState::Free, std::memory_order_release);
+
+        // Drain any events from the Vyukov queue
+        uintptr_t tail = Tail.exchange(reinterpret_cast<uintptr_t>(StubPtr()),
+                                       std::memory_order_acq_rel);
+        if (tail != reinterpret_cast<uintptr_t>(StubPtr()) && tail != 0) {
+            // Walk from Head through linked events
+            IEventHandle* head = Head.load(std::memory_order_relaxed);
+            if (head == StubPtr()) {
+                uintptr_t sn = Stub.load(std::memory_order_acquire);
+                if (sn) {
+                    head = reinterpret_cast<IEventHandle*>(sn);
+                } else {
+                    head = nullptr;
+                }
+            }
+            while (head && head != StubPtr()) {
+                IEventHandle* ev = head;
+                IEventHandle* next = GetNextPtrAcquire(ev);
                 hadEvents = true;
                 delete ev;
-            } while (top);
+                head = next;
+            }
         }
 
-        if (EventHead) {
-            do {
-                IEventHandle* ev = EventHead;
-                EventHead = GetNextPtr(ev);
-                hadEvents = true;
-                delete ev;
-            } while (EventHead);
-            EventTail = nullptr;
-        }
+        Head.store(StubPtr(), std::memory_order_relaxed);
+        Stub.store(0, std::memory_order_relaxed);
 
         return !hadEvents;
     }
@@ -361,276 +364,194 @@ namespace NActors {
         Cleanup();
     }
 
-    void TMailbox::OnPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept {
-        Y_DEBUG_ABORT_UNLESS(head && tail);
-        Y_DEBUG_ABORT_UNLESS(GetNextPtr(tail) == nullptr);
-    }
-
-    void TMailbox::AppendPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept {
-        OnPreProcessed(head, tail);
-        if (EventTail) {
-            SetNextPtr(EventTail, head);
-            EventTail = tail;
-        } else {
-            EventHead = head;
-            EventTail = tail;
-        }
-    }
-
-    void TMailbox::PrependPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept {
-        OnPreProcessed(head, tail);
-        if (EventHead) {
-            SetNextPtr(tail, EventHead);
-            EventHead = head;
-        } else {
-            EventHead = head;
-            EventTail = tail;
-        }
-    }
+    // ---- Vyukov MPSC queue: Push (wait-free) ----
 
     EMailboxPush TMailbox::Push(std::unique_ptr<IEventHandle>& evPtr) noexcept {
+        EState state = State.load(std::memory_order_acquire);
+        if (state == EState::Free) {
+            return EMailboxPush::Free;
+        }
+
         IEventHandle* ev = evPtr.release();
-        uintptr_t current = NextEventPtr.load(std::memory_order_relaxed);
-        for (;;) {
-            if (current == MarkerFree) {
-                evPtr.reset(ev);
-                return EMailboxPush::Free;
+        ev->NextLinkPtr.store(0, std::memory_order_relaxed);
+
+        uintptr_t prev = Tail.exchange(reinterpret_cast<uintptr_t>(ev),
+                                       std::memory_order_acq_rel);
+
+        reinterpret_cast<IEventHandle*>(prev)->NextLinkPtr.store(
+            reinterpret_cast<uintptr_t>(ev), std::memory_order_release);
+
+        if (prev == reinterpret_cast<uintptr_t>(StubPtr())) {
+            // Queue was empty. If the mailbox was idle, transition to locked.
+            EState expected = EState::Idle;
+            if (State.compare_exchange_strong(expected, EState::Locked,
+                    std::memory_order_acq_rel)) {
+                return EMailboxPush::Locked;
             }
-            if (current == MarkerUnlocked) {
-                // Note: try to lock an unlocked mailbox
-                // The acquire memory order synchronizes with release in TryUnlock on success
-                if (NextEventPtr.compare_exchange_weak(current, 0, std::memory_order_acquire)) {
-                    // Success: add this event to the preprocessed events tail
-                    SetNextPtr(ev, uintptr_t(0));
-                    AppendPreProcessed(ev, ev);
-                    return EMailboxPush::Locked;
-                }
-            } else {
-                // Note: try to push event on top of the stack
-                // The release memory order synchronizes with acquire in Pop on success
-                SetNextPtr(ev, current);
-                if (NextEventPtr.compare_exchange_weak(current, reinterpret_cast<uintptr_t>(ev), std::memory_order_release)) {
-                    return EMailboxPush::Pushed;
-                }
-            }
+            // State was Locked (consumer running) — just an add
         }
+        return EMailboxPush::Pushed;
     }
 
-    IEventHandle* TMailbox::PreProcessEvents() noexcept {
-        uintptr_t current = NextEventPtr.load(std::memory_order_acquire);
-        while (current && current != MarkerFree) {
-            Y_DEBUG_ABORT_UNLESS(current != MarkerUnlocked);
-            IEventHandle* last = reinterpret_cast<IEventHandle*>(current);
-
-            // Eagerly move events to preprocessed on every iteration
-            // We avoid unnecessary races with the pusher over the top of the stack
-            if (IEventHandle* newTail = GetNextPtr(last)) {
-                SetNextPtr(last, nullptr);
-
-                // This inverts the list, forming the new [head, tail] list
-                IEventHandle* newHead = newTail;
-                IEventHandle* next = nullptr;
-                while (IEventHandle* prev = GetNextPtr(newHead)) {
-                    SetNextPtr(newHead, next);
-                    next = newHead;
-                    newHead = prev;
-                }
-                SetNextPtr(newHead, next);
-
-                // Append the new partial list to preprocessed events
-                AppendPreProcessed(newHead, newTail);
-
-                // Now we have at least one preprocessed event
-                return last;
-            }
-
-            if (EventHead) {
-                // We already have some preprocessed events
-                return last;
-            }
-
-            // We need to take a single item and replace it with nullptr
-            if (NextEventPtr.compare_exchange_strong(current, 0, std::memory_order_acquire)) {
-                AppendPreProcessed(last, last);
-                return nullptr;
-            }
-
-            // We have failed, but the next iteration will have more than one item
-        }
-
-        return nullptr;
-    }
-
-    IEventHandle* TMailbox::DrainToLocal(IEventHandle*& tailOut) noexcept {
-        if (!EventHead) {
-            PreProcessEvents();
-        }
-        IEventHandle* head = EventHead;
-        tailOut = EventTail;
-        EventHead = nullptr;
-        EventTail = nullptr;
-        return head;
-    }
-
-    void TMailbox::ReattachEventChain(IEventHandle* localHead, IEventHandle* localTail) noexcept {
-        if (!localHead) {
-            return;
-        }
-        // Prepend to existing EventHead (local events are older)
-        if (EventHead) {
-            SetNextPtr(localTail, EventHead);
-            EventHead = localHead;
-        } else {
-            EventHead = localHead;
-            EventTail = localTail;
-        }
-    }
+    // ---- Vyukov MPSC queue: Pop (standalone, handles idle transition) ----
 
     std::unique_ptr<IEventHandle> TMailbox::Pop() noexcept {
-        if (!EventHead) {
-            PreProcessEvents();
+        IEventHandle* head = Head.load(std::memory_order_relaxed);
+
+        if (head == StubPtr()) {
+            uintptr_t sn = Stub.load(std::memory_order_acquire);
+            if (!sn) {
+                return nullptr;
+            }
+            head = reinterpret_cast<IEventHandle*>(sn);
+            Stub.store(0, std::memory_order_relaxed);
+            // Must update Head before attempting CAS below: if CAS fails
+            // (incomplete push) we return nullptr, and Head must point to
+            // the consumed event so the next Pop() can find it.
+            Head.store(head, std::memory_order_relaxed);
         }
 
-        IEventHandle* ev = EventHead;
-        if (ev) {
-            EventHead = GetNextPtr(ev);
-            if (!EventHead) {
-                EventTail = nullptr;
+        IEventHandle* result = head;
+        IEventHandle* next = GetNextPtrAcquire(result);
+
+        if (next) {
+            Head.store(next, std::memory_order_relaxed);
+        } else {
+            // Try to empty the queue: CAS(Tail, result, StubPtr)
+            uintptr_t expected = reinterpret_cast<uintptr_t>(result);
+            if (Tail.compare_exchange_strong(expected,
+                    reinterpret_cast<uintptr_t>(StubPtr()),
+                    std::memory_order_acq_rel)) {
+                Head.store(StubPtr(), std::memory_order_relaxed);
+            } else {
+                // Incomplete push — a producer linked prev but hasn't
+                // stored next yet. Leave Head on result for retry.
+                return nullptr;
             }
-            SetNextPtr(ev, nullptr);
         }
-        return std::unique_ptr<IEventHandle>(ev);
+
+        SetNextPtr(result, nullptr);
+        return std::unique_ptr<IEventHandle>(result);
     }
 
     std::pair<ui32, ui32> TMailbox::CountMailboxEvents(ui64 localActorId, ui32 maxTraverse) noexcept {
-        IEventHandle* last = PreProcessEvents();
-
         ui32 local = 0;
         ui32 total = 0;
-        for (IEventHandle* ev = EventHead; ev; ev = GetNextPtr(ev)) {
+
+        IEventHandle* head = Head.load(std::memory_order_relaxed);
+        if (head == StubPtr()) {
+            uintptr_t sn = Stub.load(std::memory_order_acquire);
+            if (sn) {
+                head = reinterpret_cast<IEventHandle*>(sn);
+            } else {
+                return { 0, 0 };
+            }
+        }
+
+        for (IEventHandle* ev = head; ev; ev = GetNextPtrAcquire(ev)) {
             ++total;
             if (ev->GetRecipientRewrite().LocalId() == localActorId) {
                 ++local;
             }
             if (total >= maxTraverse) {
-                return { local, total };
-            }
-        }
-
-        if (last) {
-            ++total;
-            if (last->GetRecipientRewrite().LocalId() == localActorId) {
-                ++local;
+                break;
             }
         }
 
         return { local, total };
     }
 
+    //FIXME: Unused?
     bool TMailbox::TryLock() noexcept {
-        uintptr_t expected = MarkerUnlocked;
-        return NextEventPtr.compare_exchange_strong(expected, 0, std::memory_order_acquire);
+        // Transition from Idle to Locked. Used by the multi-threaded
+        // push/pop test to acquire the lock without pushing an event.
+        EState expected = EState::Idle;
+        return State.compare_exchange_strong(expected, EState::Locked,
+            std::memory_order_acq_rel);
     }
 
+    // Used only by Unlock() in to attempt a fast transition to idle without scheduling.
     bool TMailbox::TryUnlock() noexcept {
-        if (EventHead) {
+        if (Head.load(std::memory_order_relaxed) != StubPtr()) {
             return false;
         }
-
-        uintptr_t current = NextEventPtr.load(std::memory_order_relaxed);
-        if (current != 0) {
+        if (Stub.load(std::memory_order_acquire)) {
             return false;
         }
-
-        return NextEventPtr.compare_exchange_strong(current, MarkerUnlocked, std::memory_order_release);
+        if (Tail.load(std::memory_order_acquire) != reinterpret_cast<uintptr_t>(StubPtr())) {
+            return false;
+        }
+        // Queue appears empty. Transition to idle.
+        EState expected = EState::Locked;
+        if (!State.compare_exchange_strong(expected, EState::Idle,
+                std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return false;
+        }
+        // Double-check: a Push may have raced between our Tail check and
+        // the State CAS. The producer did prev = Tail.exchange(ev) (getting
+        // StubPtr), then CAS Idle→Locked failed (State was still Locked),
+        // returning Pushed. Now State is Idle but events exist.
+        //
+        // After this CAS, any NEW Push sees Idle and will CAS Idle→Locked
+        // successfully (returning Locked → caller schedules). But a Push
+        // that already passed its CAS before our State CAS is the gap.
+        if (Stub.load(std::memory_order_acquire)
+                || Tail.load(std::memory_order_acquire) != reinterpret_cast<uintptr_t>(StubPtr())) {
+            // Events arrived in the race window. Try to re-lock.
+            EState idle = EState::Idle;
+            if (State.compare_exchange_strong(idle, EState::Locked,
+                    std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                // Re-locked. Return false to trigger reschedule.
+                return false;
+            }
+            // Push already CAS'd Idle→Locked and will schedule. We're done.
+        }
+        return true;
     }
 
     void TMailbox::PushFront(std::unique_ptr<IEventHandle>&& evPtr) noexcept {
-        IEventHandle* ev = evPtr.release();
+        IEventHandle* e = evPtr.release();
 
 #ifdef ACTORSLIB_COLLECT_EXEC_STATS
-        // This is similar to sending the event again
-        ev->SendTime = (::NHPTimer::STime)GetCycleCountFast();
+        e->SendTime = (::NHPTimer::STime)GetCycleCountFast();
 #endif
 
-        SetNextPtr(ev, nullptr);
-        PrependPreProcessed(ev, ev);
-    }
-
-    ui64 TMailbox::DrainPending() noexcept {
-        ui64 drained = 0;
-        // Take the entire NextEventPtr stack via CAS, reverse it into
-        // FIFO order, and append to EventHead. Repeat until empty.
-        // We don't use PreProcessEvents() here because its loop
-        // stalls when NextEventPtr has exactly one item and EventHead
-        // is non-empty (it returns non-null without moving the item).
-        for (;;) {
-            uintptr_t current = NextEventPtr.load(std::memory_order_acquire);
-            if (current <= MarkerFree) {  // 0=locked, 1=unlocked, 2=free
-                break;
-            }
-            if (!NextEventPtr.compare_exchange_weak(current, 0, std::memory_order_acquire)) {
-                continue;
-            }
-            // Reverse the LIFO stack into FIFO order and count
-            IEventHandle* tail = reinterpret_cast<IEventHandle*>(current);
-            IEventHandle* head = tail;
-            IEventHandle* next = nullptr;
-            ui64 batchCount = 1;
-            while (IEventHandle* prev = GetNextPtr(head)) {
-                SetNextPtr(head, next);
-                next = head;
-                head = prev;
-                ++batchCount;
-            }
-            SetNextPtr(head, next);
-            AppendPreProcessed(head, tail);
-            drained += batchCount;
+        IEventHandle* head = Head.load(std::memory_order_relaxed);
+        if (head == StubPtr()) {
+            uintptr_t sn = Stub.load(std::memory_order_relaxed);
+            SetNextPtr(e, sn ? reinterpret_cast<IEventHandle*>(sn) : nullptr);
+            Stub.store(reinterpret_cast<uintptr_t>(e), std::memory_order_relaxed);
+        } else {
+            SetNextPtr(e, head);
+            Head.store(e, std::memory_order_relaxed);
         }
-        return drained;
     }
 
     bool TMailbox::IsFree() const noexcept {
-        return NextEventPtr.load(std::memory_order_relaxed) == MarkerFree;
+        return State.load(std::memory_order_relaxed) == EState::Free;
     }
 
+    // Called by consumer thread to prevent new events from being added to a mailbox that's being cleaned up
     void TMailbox::LockToFree() noexcept {
-        uintptr_t current = NextEventPtr.exchange(MarkerFree, std::memory_order_acquire);
-        if (current) {
-            Y_DEBUG_ABORT_UNLESS(current != MarkerUnlocked, "LockToFree called on an unlocked mailbox");
-            Y_DEBUG_ABORT_UNLESS(current != MarkerFree, "LockToFree called on a mailbox that is already free");
-            IEventHandle* newTail = reinterpret_cast<IEventHandle*>(current);
-            IEventHandle* newHead = newTail;
-            IEventHandle* next = nullptr;
-            while (IEventHandle* prev = GetNextPtr(newHead)) {
-                SetNextPtr(newHead, next);
-                next = newHead;
-                newHead = prev;
-            }
-            SetNextPtr(newHead, next);
-
-            if (EventTail) {
-                SetNextPtr(EventTail, newHead);
-                EventTail = newTail;
-            } else {
-                EventHead = newHead;
-                EventTail = newTail;
-            }
+        auto locked = EState::Locked;
+        if (!State.compare_exchange_strong(locked, EState::Free,
+                std::memory_order_acq_rel)) {
+            Y_ABORT("LockToFree called on a non-locked mailbox");
         }
     }
 
-    bool TMailbox::TryLockToFree() noexcept {
-        uintptr_t expected = 0;  // locked, no events
-        return NextEventPtr.compare_exchange_strong(expected, MarkerFree, std::memory_order_acquire);
-    }
-
+    // Called by pool on freshly allocated mailbox before attaching actors
     void TMailbox::LockFromFree() noexcept {
-        uintptr_t current = MarkerFree;
-        if (!NextEventPtr.compare_exchange_strong(current, 0, std::memory_order_relaxed)) {
-            Y_ABORT("LockFromFree called on a mailbox that is not free");
+        auto free = EState::Free;
+        if (!State.compare_exchange_strong(free, EState::Locked,
+                std::memory_order_acq_rel)) {
+            Y_ABORT("LockFromFree called on a non-free mailbox");
         }
     }
 
+    // Really should be called "Schedule"
+    // Called by pool to activate freshly created actor
+    // Called by thread to activate mailbox that still has events
     void TMailbox::Unlock(IExecutorPool* pool, NHPTimer::STime now, ui64& revolvingCounter) {
         if (!TryUnlock()) {
             ScheduleMoment = now;

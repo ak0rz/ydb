@@ -22,10 +22,18 @@ namespace NActors {
     };
 
     class alignas(64) TMailbox {
-    private:
-        static constexpr uintptr_t MarkerUnlocked = 1;
-        static constexpr uintptr_t MarkerFree = 2;
+    public:
+        // Mailbox lifecycle state (visible to Push callers).
+        // Locked = consumer running, Push → Pushed.
+        // Idle = no consumer, first Push → Locked (caller schedules).
+        // Free = no actors, Push → Free (rejected).
+        enum class EState : ui8 {
+            Locked = 0,
+            Idle = 1,
+            Free = 2,
+        };
 
+    private:
         enum class EActorPack : ui8 {
             Empty = 0,
             Simple = 1,
@@ -123,57 +131,51 @@ namespace NActors {
     public:
         /**
          * Tries to push ev to the mailbox and returns the status. When it is
-         * EMailboxPush::Locked a previously unlocked mailbox becomes locked
+         * EMailboxPush::Locked a previously idle mailbox becomes locked
          * and needs to be scheduled for execution by the caller. When it is
          * EMailboxPush::Pushed the event is added to the queue. When it is
-         * EMailboxPush::Free the mailbox is currently locked by a free list
+         * EMailboxPush::Free the mailbox is currently free (no actors)
          * and the event cannot be delivered.
+         *
+         * Vyukov MPSC queue: wait-free (single xchg + one release store).
          */
         EMailboxPush Push(std::unique_ptr<IEventHandle>& ev) noexcept;
 
         /**
-         * Removes the next event from the mailbox. Returns nullptr for an
-         * empty mailbox, which stays locked.
+         * Removes the next event from the mailbox. Returns nullptr when
+         * the queue is empty or the head event's next pointer is not yet
+         * visible (incomplete push). The mailbox stays locked.
+         *
+         * Standalone Pop handles the idle transition via CAS on Tail.
          */
         std::unique_ptr<IEventHandle> Pop() noexcept;
 
         /**
-         * Counts the number of events for the given localActorId
+         * Counts the number of events for the given localActorId.
+         * Walks the chain from Head through linked next pointers.
          */
         std::pair<ui32, ui32> CountMailboxEvents(ui64 localActorId, ui32 maxTraverse) noexcept;
 
         /**
-         * Tries to lock an unlocked empty mailbox and returns true on success.
+         * Tries to lock an idle mailbox and returns true on success.
          *
-         * Returns true only when mailbox was empty and not locked by another thread.
+         * Returns true only when Tail == StubPtr() (idle) and CAS succeeds.
          */
         bool TryLock() noexcept;
 
         /**
-         * Tries to unlock an empty locked mailbox and returns true on success.
+         * Tries to transition a locked empty mailbox to idle.
          *
-         * Returns true only when mailbox is empty.
+         * Returns true only when Head is at stub, stub has no pending link,
+         * and Tail can be CAS'd back to StubPtr().
          */
         bool TryUnlock() noexcept;
 
         /**
-         * Pushes ev to the front of the mailbox, which must be locked. This
-         * is useful when an event needs to be injected at the front of the
-         * queue.
+         * Pushes ev to the front of the mailbox, which must be locked.
+         * Used by test framework to inject events at the head of the queue.
          */
         void PushFront(std::unique_ptr<IEventHandle>&& ev) noexcept;
-
-        /**
-         * Drains all events from NextEventPtr into the EventHead/EventTail
-         * chain. After this call, all pending events are in EventHead and
-         * NextEventPtr is empty (for a locked mailbox).
-         *
-         * Returns the number of events drained.
-         *
-         * Used by work-stealing to snapshot pre-existing events before
-         * a batch so the caller can limit execution to that count.
-         */
-        ui64 DrainPending() noexcept;
 
         /**
          * Returns true for free mailboxes
@@ -181,23 +183,21 @@ namespace NActors {
         bool IsFree() const noexcept;
 
         /**
-         * Locks the mailbox that had the last actor detached.
-         *
-         * All events currently in the mailbox are moved to the local queue
-         * and need to be processed individually until Pop() returns nullptr.
+         * Transitions a locked mailbox to free state.
+         * Drains all remaining events for cleanup.
          */
         void LockToFree() noexcept;
 
         /**
-         * Race-safe variant of LockToFree. Uses CAS instead of exchange,
-         * so it fails (returns false) if events arrived in NextEventPtr
-         * between the caller's IsEmpty() check and this call.
-         * On failure the mailbox stays locked — caller should use Unlock().
+         * Race-safe variant of LockToFree. Uses CAS on Tail, so it fails
+         * (returns false) if events arrived between the caller's check
+         * and this call. On failure the mailbox stays locked.
          */
         bool TryLockToFree() noexcept;
 
         /**
-         * Locks the mailbox after initial state or a LockToFree call.
+         * Transitions a free mailbox to locked state.
+         * Drains any orphan events pushed between LockToFree and now.
          */
         void LockFromFree() noexcept;
 
@@ -209,36 +209,21 @@ namespace NActors {
         /**
          * Returns true when a free mailbox can be reclaimed
          */
-        bool CanReclaim() const {
+        bool CanReclaim() const noexcept {
             Y_DEBUG_ABORT_UNLESS(IsFree());
-            return !EventHead;
+            return Head.load(std::memory_order_relaxed) == StubPtr();
         }
 
         /**
-         * Refill EventHead from NextEventPtr (via PreProcessEvents) if empty,
-         * then detach the entire EventHead chain. Returns the head of the
-         * chain or nullptr. Writes the tail to *tailOut when non-null.
-         * Caller owns the chain until ReattachEventChain.
-         *
-         * Lock holder only. Used by WS local-cursor batch processing to
-         * avoid per-event writes to EventHead (same cache line as NextEventPtr).
+         * Returns a pointer to the stub node, used as sentinel.
          */
-        IEventHandle* DrainToLocal(IEventHandle*& tailOut) noexcept;
-
-        /**
-         * Prepend a previously detached chain back to EventHead.
-         * localHead/localTail bracket the chain (linked via NextLinkPtr).
-         * O(1) — no traversal needed when tail is known.
-         * Lock holder only.
-         */
-        void ReattachEventChain(IEventHandle* localHead, IEventHandle* localTail) noexcept;
+        IEventHandle* StubPtr() const noexcept {
+            return reinterpret_cast<IEventHandle*>(const_cast<std::atomic<uintptr_t>*>(&Stub));
+        }
 
     private:
         void EnsureActorMap();
-        void OnPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept;
-        void AppendPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept;
-        void PrependPreProcessed(IEventHandle* head, IEventHandle* tail) noexcept;
-        IEventHandle* PreProcessEvents() noexcept;
+        void DrainAndDelete(uintptr_t tail) noexcept;
         void CleanupActor(IActor* actor) noexcept;
 
     public:
@@ -246,9 +231,10 @@ namespace NActors {
 
         EActorPack ActorPack = EActorPack::Empty;
 
+        std::atomic<EState> State{ EState::Free };
+
         // Work-stealing: 1-based index of the last slot that executed this mailbox.
         // 0 means fresh/unassigned. Written by slot after execution (relaxed store).
-        // Fits in padding between ActorPack (1 byte) and TActorsInfo (8-byte aligned).
         ui16 LastPoolSlotIdx = 0;
 
         static constexpr TMailboxType::EType Type = TMailboxType::LockFreeIntrusive;
@@ -258,12 +244,16 @@ namespace NActors {
         // Used by executor run list
         std::atomic<uintptr_t> NextRunPtr{ 0 };
 
-        // An atomic stack of new events in reverse order
-        std::atomic<uintptr_t> NextEventPtr{ MarkerFree };
+        // Vyukov MPSC queue tail (producers xchg here)
+        std::atomic<uintptr_t> Tail{ 0 };
 
-        // Preprocessed events ready for consumption
-        IEventHandle* EventHead{ nullptr };
-        IEventHandle* EventTail{ nullptr };
+        // Consumer head pointer. Atomic for cross-thread visibility when
+        // the mailbox is transferred between workers via scheduling.
+        std::atomic<IEventHandle*> Head{ nullptr };
+
+        // Preallocated stub node for the Vyukov MPSC queue sentinel.
+        // reinterpret_cast<IEventHandle*>(&Stub)->NextLinkPtr aliases Stub.
+        std::atomic<uintptr_t> Stub{ 0 };
 
         // Used to track how much time until activation
         NHPTimer::STime ScheduleMoment{ 0 };
