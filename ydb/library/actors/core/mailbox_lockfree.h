@@ -21,7 +21,16 @@ namespace NActors {
         ui64 ElapsedCycles = 0;
     };
 
+    enum class ESnapshotResult {
+        Idle,
+        NeedsReschedule,
+    };
+
+    class TMailboxSnapshot;
+
     class alignas(64) TMailbox {
+        friend class TMailboxSnapshot;
+
     public:
         // Mailbox lifecycle state (visible to Push callers).
         // Locked = consumer running, Push → Pushed.
@@ -260,6 +269,32 @@ namespace NActors {
     };
 
     static_assert(sizeof(TMailbox) <= 64, "TMailbox is too large");
+
+    /**
+     * Lightweight snapshot of a mailbox for batch event processing.
+     *
+     * Stores a local cursor and a snapshotted tail boundary. Pop() returns
+     * events up to (and including) the snapshot tail. The destructor updates
+     * the mailbox Head and writes the caller-provided ESnapshotResult.
+     *
+     * Does NOT handle idle transition — that's done by standalone Pop()/TryUnlock().
+     */
+    class TMailboxSnapshot {
+    public:
+        TMailboxSnapshot(TMailbox* mb, ESnapshotResult& result) noexcept;
+        ~TMailboxSnapshot() noexcept;
+
+        TMailboxSnapshot(const TMailboxSnapshot&) = delete;
+        TMailboxSnapshot& operator=(const TMailboxSnapshot&) = delete;
+
+        std::unique_ptr<IEventHandle> Pop() noexcept;
+
+    private:
+        TMailbox* Mailbox;
+        IEventHandle* Cursor;
+        IEventHandle* SnapshotTail;
+        ESnapshotResult& Result;
+    };
 
     class TMailboxTable {
     public:

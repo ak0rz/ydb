@@ -559,6 +559,93 @@ namespace NActors {
         }
     }
 
+    // ---- TMailboxSnapshot ----
+
+    TMailboxSnapshot::TMailboxSnapshot(TMailbox* mb, ESnapshotResult& result) noexcept
+        : Mailbox(mb), Cursor(nullptr), SnapshotTail(nullptr), Result(result)
+    {
+        Result = ESnapshotResult::Idle;
+
+        uintptr_t tail = mb->Tail.load(std::memory_order_acquire);
+        if (tail == reinterpret_cast<uintptr_t>(mb->StubPtr())) {
+            return;
+        }
+        SnapshotTail = reinterpret_cast<IEventHandle*>(tail);
+
+        IEventHandle* head = mb->Head.load(std::memory_order_relaxed);
+        if (head == mb->StubPtr()) {
+            uintptr_t sn = mb->Stub.load(std::memory_order_acquire);
+            if (!sn) {
+                return;
+            }
+            Cursor = reinterpret_cast<IEventHandle*>(sn);
+            mb->Stub.store(0, std::memory_order_relaxed);
+        } else {
+            Cursor = head;
+        }
+    }
+
+    std::unique_ptr<IEventHandle> TMailboxSnapshot::Pop() noexcept {
+        if (!Cursor) {
+            return nullptr;
+        }
+
+        IEventHandle* result = Cursor;
+        IEventHandle* next = GetNextPtrAcquire(result);
+
+        if (result == SnapshotTail) {
+            // Snapshot boundary: commit Head and do CAS-based pop with
+            // idle introspection instead of the normal snapshot walk.
+            Mailbox->Head.store(result, std::memory_order_relaxed);
+            Cursor = nullptr;
+
+            if (next) {
+                // Events exist beyond the snapshot boundary.
+                Mailbox->Head.store(next, std::memory_order_relaxed);
+                Result = ESnapshotResult::NeedsReschedule;
+            } else {
+                // Try to idle the queue: CAS(Tail, result, StubPtr)
+                uintptr_t expected = reinterpret_cast<uintptr_t>(result);
+                if (Mailbox->Tail.compare_exchange_strong(expected,
+                        reinterpret_cast<uintptr_t>(Mailbox->StubPtr()),
+                        std::memory_order_acq_rel)) {
+                    Mailbox->Head.store(Mailbox->StubPtr(), std::memory_order_relaxed);
+                    Result = ESnapshotResult::Idle;
+                } else {
+                    // Incomplete push — Head points to result for retry.
+                    Result = ESnapshotResult::NeedsReschedule;
+                    return nullptr;
+                }
+            }
+
+            SetNextPtr(result, nullptr);
+            return std::unique_ptr<IEventHandle>(result);
+        }
+
+        // Normal snapshot walk for events before SnapshotTail
+        if (!next) {
+            return nullptr;  // incomplete push, leave Cursor on result
+        }
+
+        Cursor = next;
+        SetNextPtr(result, nullptr);
+        return std::unique_ptr<IEventHandle>(result);
+    }
+
+    TMailboxSnapshot::~TMailboxSnapshot() noexcept {
+        if (!Cursor) {
+            // Either the queue was empty at construction (Result = Idle from ctor),
+            // or Pop() consumed the snapshot boundary via CAS and already
+            // handled Head update and set Result. Nothing to do.
+            return;
+        }
+
+        // Budget exhausted or incomplete push before reaching SnapshotTail.
+        // Release store: next consumer thread acquires Head after reschedule.
+        Mailbox->Head.store(Cursor, std::memory_order_release);
+        Result = ESnapshotResult::NeedsReschedule;
+    }
+
     TMailboxCache::TMailboxCache(TMailboxTable* table)
         : Table(table)
     {}

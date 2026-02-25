@@ -114,6 +114,123 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
         m.LockToFree();
     }
 
+    Y_UNIT_TEST(SnapshotBudgetExhausted) {
+        TMailbox m;
+        m.LockFromFree();
+        UNIT_ASSERT(m.TryUnlock());
+
+        // Push 5 events
+        for (size_t i = 0; i < 5; ++i) {
+            std::unique_ptr<IEventHandle> ev = std::make_unique<IEventHandle>(
+                TActorId(), TActorId(), new TEvents::TEvPing, 0, i);
+            m.Push(ev);
+        }
+
+        // Use snapshot to pop with a budget of 3 — doesn't reach SnapshotTail
+        ESnapshotResult result;
+        {
+            TMailboxSnapshot snapshot(&m, result);
+            for (ui32 i = 0; i < 3; ++i) {
+                auto ev = snapshot.Pop();
+                if (!ev) break;
+                UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+            }
+        }
+        UNIT_ASSERT(result == ESnapshotResult::NeedsReschedule);
+
+        // Remaining events should be accessible via standalone Pop
+        for (size_t i = 3; i < 5; ++i) {
+            auto ev = m.Pop();
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+        }
+        UNIT_ASSERT(!m.Pop());
+        UNIT_ASSERT(m.TryUnlock());
+        m.LockToFree();
+    }
+
+    Y_UNIT_TEST(SnapshotIdle) {
+        TMailbox m;
+        m.LockFromFree();
+        UNIT_ASSERT(m.TryUnlock());
+
+        // Push 3 events to idle mailbox (first push returns Locked)
+        for (size_t i = 0; i < 3; ++i) {
+            std::unique_ptr<IEventHandle> ev = std::make_unique<IEventHandle>(
+                TActorId(), TActorId(), new TEvents::TEvPing, 0, i);
+            m.Push(ev);
+        }
+
+        // Snapshot consumes all 3 events. The last one (SnapshotTail) triggers
+        // CAS-based pop. Since no new events arrive, CAS succeeds → Idle.
+        ESnapshotResult result;
+        {
+            TMailboxSnapshot snapshot(&m, result);
+            for (ui32 i = 0; i < 10; ++i) {
+                auto ev = snapshot.Pop();
+                if (!ev) break;
+                UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+            }
+        }
+        UNIT_ASSERT(result == ESnapshotResult::Idle);
+
+        // Queue should be empty. TryUnlock succeeds (Tail/Head/Stub at stub/0).
+        UNIT_ASSERT(m.TryUnlock());
+        m.TryLock();
+        m.LockToFree();
+    }
+
+    Y_UNIT_TEST(SnapshotNeedsReschedule) {
+        TMailbox m;
+        m.LockFromFree();
+        UNIT_ASSERT(m.TryUnlock());
+
+        // Push 3 events
+        for (size_t i = 0; i < 3; ++i) {
+            std::unique_ptr<IEventHandle> ev = std::make_unique<IEventHandle>(
+                TActorId(), TActorId(), new TEvents::TEvPing, 0, i);
+            m.Push(ev);
+        }
+
+        // Snapshot captures Tail at event 2.
+        // Push 2 more events AFTER the snapshot is created but before
+        // consuming SnapshotTail — simulates concurrent producers.
+        ESnapshotResult result;
+        {
+            TMailboxSnapshot snapshot(&m, result);
+
+            // Pop events 0 and 1 (normal walk)
+            for (ui32 i = 0; i < 2; ++i) {
+                auto ev = snapshot.Pop();
+                UNIT_ASSERT(ev);
+                UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+            }
+
+            // Push 2 more events (concurrent producers)
+            for (size_t i = 3; i < 5; ++i) {
+                std::unique_ptr<IEventHandle> ev = std::make_unique<IEventHandle>(
+                    TActorId(), TActorId(), new TEvents::TEvPing, 0, i);
+                m.Push(ev);
+            }
+
+            // Pop event 2 (SnapshotTail). CAS-based pop detects events
+            // beyond boundary → NeedsReschedule.
+            auto ev = snapshot.Pop();
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, (ui64)2);
+        }
+        UNIT_ASSERT(result == ESnapshotResult::NeedsReschedule);
+
+        // Post-snapshot events are accessible via standalone Pop
+        for (size_t i = 3; i < 5; ++i) {
+            auto ev = m.Pop();
+            UNIT_ASSERT(ev);
+            UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+        }
+        UNIT_ASSERT(!m.Pop());
+        UNIT_ASSERT(m.TryUnlock());
+        m.LockToFree();
+    }
 
     Y_UNIT_TEST(PushFront) {
         TMailbox m;
