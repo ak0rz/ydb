@@ -203,29 +203,28 @@ namespace NActors {
         void CleanupActor(IActor* actor) noexcept;
 
     public:
-        ui32 Hint = 0;
-
-        std::atomic<EActorPack> ActorPack{ EActorPack::Empty };
-
         static constexpr TMailboxType::EType Type = TMailboxType::LockFreeIntrusive;
 
-        TActorsInfo ActorsInfo{ .Empty = {} };
-
+        // == PRODUCER LINE ==
+        ui32 Hint = 0;
         // Used by executor run list
         std::atomic<uintptr_t> NextRunPtr{ 0 };
-
         // An atomic stack of new events in reverse order
         std::atomic<uintptr_t> NextEventPtr{ MarkerFree };
+        // Used to track how much time until activation
+        NHPTimer::STime ScheduleMoment{ 0 };
 
+        // == CONSUMER LINE ==
         // Preprocessed events ready for consumption
+        alignas(64) EActorPack ActorPack{ EActorPack::Empty };
+        TActorsInfo ActorsInfo{ .Empty = {} };
+        
         IEventHandle* EventHead{ nullptr };
         IEventHandle* EventTail{ nullptr };
 
-        // Used to track how much time until activation
-        NHPTimer::STime ScheduleMoment{ 0 };
     };
 
-    static_assert(sizeof(TMailbox) <= 64, "TMailbox is too large");
+    static_assert(sizeof(TMailbox) <= 128, "TMailbox is too large");
 
     class TMailboxTable {
     public:
