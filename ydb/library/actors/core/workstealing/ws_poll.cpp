@@ -14,9 +14,8 @@ namespace NActors::NWorkStealing {
             ui32 EventsProcessed = 0;
         };
 
-        // Execute a mailbox activation using TMailboxSnapshot.
-        // Resolves hint → mailbox, processes events up to budget/time,
-        // finalizes (stats, dead actor cleanup, idle transition).
+        // Execute a mailbox activation. Resolves hint → mailbox,
+        // processes events up to budget/time, finalizes.
         TBatchResult ExecuteActivationBatch(
             ui32 hint,
             TWsMailboxTable* wsTable,
@@ -37,7 +36,7 @@ namespace NActors::NWorkStealing {
                 return batch;
             }
 
-            auto result = ctx->ExecuteActivation(mailbox, eventBudget, deadlineCycles, hpnow);
+            auto result = ctx->ExecuteActivation(mailbox, eventBudget, deadlineCycles, hpnow, slotIdx);
             batch.EventsProcessed = result.EventsProcessed;
 
             if (result.EventsProcessed > 0) {
@@ -45,8 +44,19 @@ namespace NActors::NWorkStealing {
                 counters.Executions.fetch_add(result.EventsProcessed, std::memory_order_relaxed);
             }
 
-            bool done = ctx->FinalizeActivation(mailbox, slotIdx, hpnow);
-            batch.HasMore = !done;
+            if (result.IsIdle) {
+                // Mailbox went idle inside Pop (CAS succeeded).
+                // Do NOT access mailbox — a new consumer may be active.
+                // Use cached values from TActivationResult for stats + reclaim.
+                ctx->FlushStatsOnly(hpnow);
+                if (result.MailboxWasEmpty) {
+                    ctx->FreeHint(result.Hint);
+                }
+                batch.HasMore = false;
+            } else {
+                bool done = ctx->FinalizeActivation(mailbox, hpnow);
+                batch.HasMore = !done;
+            }
 
             return batch;
         }

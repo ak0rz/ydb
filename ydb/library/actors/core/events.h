@@ -12,6 +12,7 @@ namespace NActorsProto {
 } // NActorsProto
 
 namespace NActors {
+    class IActor;
     class TActorRunnableItem;
 
     struct TEvents {
@@ -111,6 +112,7 @@ namespace NActors {
                 Wilson,
                 Preemption,
                 ResumeRunnable,
+                RegisterActor,   // deferred new-mailbox actor registration
                 End,
 
                 // Compatibility section
@@ -237,6 +239,14 @@ namespace NActors {
 
             TEvResumeRunnable(TActorRunnableItem* item) : Item(item) {}
             ~TEvResumeRunnable();
+        };
+
+        struct TEvRegisterActor : public TEventLocal<TEvRegisterActor, TSystem::RegisterActor> {
+            IActor* Actor = nullptr;   // owns actor until consumer processes
+            ui64 LocalActorId = 0;
+            TActorId ParentId;
+
+            ~TEvRegisterActor();
         };
     };
 }

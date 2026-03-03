@@ -98,9 +98,6 @@ namespace NActors {
                     mailbox->ScheduleMoment = GetCycleCountFast();
                     ScheduleActivation(mailbox);
                     return true;
-                case EMailboxPush::Free:
-                    // message cannot be delivered
-                    break;
             }
         }
 
@@ -124,9 +121,6 @@ namespace NActors {
                     mailbox->ScheduleMoment = GetCycleCountFast();
                     SpecificScheduleActivation(mailbox);
                     return true;
-                case EMailboxPush::Free:
-                    // message cannot be delivered
-                    break;
             }
         }
 
@@ -186,16 +180,30 @@ namespace NActors {
         AtomicIncrement(ActorRegistrations);
 
         TMailbox* mailbox = cache ? cache.Allocate() : MailboxTable->Allocate();
-
-        // Free mailboxes are not executing, lock to a normal state
-        mailbox->LockFromFree();
-
         const ui64 localActorId = AllocateID();
-        mailbox->AttachActor(localActorId, actor);
-
-        // do init
         const TActorId actorId(ActorSystem->NodeId, PoolId, localActorId, mailbox->Hint);
+
+        // Push deferred registration event
+        auto* regEvent = new TEvents::TEvRegisterActor();
+        regEvent->Actor = actor;
+        regEvent->LocalActorId = localActorId;
+        regEvent->ParentId = parentId;
+        auto ev = std::make_unique<IEventHandle>(actorId, TActorId(), regEvent);
+        EMailboxPush pushResult = mailbox->Push(ev);
+        if (pushResult == EMailboxPush::Locked) {
+            // Normal case: mailbox was Idle, we locked it — schedule for execution
+            mailbox->ScheduleMoment = GetCycleCountFast();
+            ScheduleActivationEx(mailbox, ++revolvingWriteCounter);
+        }
+        // Pushed: a stale push already locked/scheduled this recycled mailbox.
+        // The consumer will process stale events (non-delivery) then our
+        // TEvRegisterActor which attaches the actor.
+
+        // Eager init on registering thread - sets SelfActorId, CreatedAtCycles_, ClassStats_ and calls Registered() on the actor.
+        // This is needed to ensure that the actor is fully initialized and registered before any other producer can send messages
+        // to it (e.g. from the parent during bootstrap).
         DoActorInit(ActorSystem, actor, actorId, parentId);
+
 #ifdef ACTORSLIB_COLLECT_EXEC_STATS
         if (ActorSystem->MonitorStuckActors()) {
             with_lock (StuckObserverMutex) {
@@ -206,10 +214,7 @@ namespace NActors {
         }
 #endif
 
-        // Once we unlock the mailbox the actor starts running and we cannot use the pointer any more
         actor = nullptr;
-
-        mailbox->Unlock(this, GetCycleCountFast(), revolvingWriteCounter);
 
         NHPTimer::STime elapsed = GetCycleCountFast() - hpstart;
         if (elapsed > 1000000) {

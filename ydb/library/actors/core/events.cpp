@@ -21,4 +21,8 @@ namespace NActors {
         }
     }
 
+    TEvents::TEvRegisterActor::~TEvRegisterActor() {
+        delete Actor; // safety net on shutdown, no-op on nullptr
+    }
+
 } // NActors

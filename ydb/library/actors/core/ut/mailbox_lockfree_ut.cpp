@@ -13,43 +13,51 @@ namespace NActors {
 
 Y_UNIT_TEST_SUITE(LockFreeMailbox) {
 
+    // Helper: pop one event via template Pop and return it with the result.
+    std::pair<std::unique_ptr<IEventHandle>, EPopResult> PopOne(TMailbox& m) {
+        IEventHandle* captured = nullptr;
+        auto result = m.Pop([&](IActor*, IEventHandle* ev) {
+            captured = ev;
+        });
+        return {std::unique_ptr<IEventHandle>(captured), result};
+    }
+
     Y_UNIT_TEST(Basics) {
         TMailbox m;
 
-        UNIT_ASSERT(m.IsFree());
         UNIT_ASSERT(m.IsEmpty());
 
-        // Check that we cannot push events to free mailboxes
-        std::unique_ptr<IEventHandle> ev1 = std::make_unique<IEventHandle>(TActorId(), TActorId(), new TEvents::TEvPing);
-        IEventHandle* ev1raw = ev1.get();
-        UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Free);
-        UNIT_ASSERT(ev1);
+        // Fresh mailbox is Idle with initialized sentinels — push transitions to Locked
+        std::unique_ptr<IEventHandle> ev1 = std::make_unique<IEventHandle>(
+            TActorId(), TActorId(), new TEvents::TEvPing, 0, 1);
+        UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Locked);
+        UNIT_ASSERT(!ev1);
 
-        // Check that we can push events after mailbox is locked from free
-        // LockFromFree puts mailbox in Locked state (consumer holds it)
-        m.LockFromFree();
-        UNIT_ASSERT(!m.IsFree());
-
-        // Push to a locked mailbox returns Pushed (consumer already running)
+        // Push to a non-idle mailbox returns Pushed
+        ev1 = std::make_unique<IEventHandle>(
+            TActorId(), TActorId(), new TEvents::TEvPing, 0, 2);
         UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Pushed);
         UNIT_ASSERT(!ev1);
 
-        // Check that we pop the event we just pushed
-        std::unique_ptr<IEventHandle> ev2 = m.Pop();
-        UNIT_ASSERT(ev2.get() == ev1raw);
+        // Pop the first event (FIFO), second event still exists
+        auto [ev2, r2] = PopOne(m);
+        UNIT_ASSERT(ev2);
+        UNIT_ASSERT_VALUES_EQUAL(ev2->Cookie, (ui64)1);
+        UNIT_ASSERT(r2 == EPopResult::Processed);
 
-        // Check that the mailbox is now empty
-        UNIT_ASSERT(!m.Pop());
+        // Pop the second event (last — queue goes idle)
+        auto [ev3, r3] = PopOne(m);
+        UNIT_ASSERT(ev3);
+        UNIT_ASSERT_VALUES_EQUAL(ev3->Cookie, (ui64)2);
+        UNIT_ASSERT(r3 == EPopResult::Idle);
 
-        // Unlocking should succeed (queue is empty)
-        UNIT_ASSERT(m.TryUnlock());
-
-        // Now push to an idle (unlocked) mailbox — first push returns Locked
-        ev1 = std::move(ev2);
-        ev2 = std::make_unique<IEventHandle>(TActorId(), TActorId(), new TEvents::TEvPing);
-        IEventHandle* ev2raw = ev2.get();
-        std::unique_ptr<IEventHandle> ev3 = std::make_unique<IEventHandle>(TActorId(), TActorId(), new TEvents::TEvPing);
-        IEventHandle* ev3raw = ev3.get();
+        // Now push to an idle mailbox — first push returns Locked
+        ev1 = std::make_unique<IEventHandle>(
+            TActorId(), TActorId(), new TEvents::TEvPing, 0, 10);
+        ev2 = std::make_unique<IEventHandle>(
+            TActorId(), TActorId(), new TEvents::TEvPing, 0, 20);
+        ev3 = std::make_unique<IEventHandle>(
+            TActorId(), TActorId(), new TEvents::TEvPing, 0, 30);
         UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Locked);
         UNIT_ASSERT(!ev1);
         UNIT_ASSERT(m.Push(ev2) == EMailboxPush::Pushed);
@@ -58,35 +66,32 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
         UNIT_ASSERT(!ev3);
 
         // Pop all three events in FIFO order
-        ev1.reset(m.Pop().release());
-        UNIT_ASSERT(ev1.get() == ev1raw);
-        ev2.reset(m.Pop().release());
-        UNIT_ASSERT(ev2.get() == ev2raw);
-        ev3.reset(m.Pop().release());
-        UNIT_ASSERT(ev3.get() == ev3raw);
-        UNIT_ASSERT(!m.Pop());
+        auto [p1, rr1] = PopOne(m);
+        UNIT_ASSERT_VALUES_EQUAL(p1->Cookie, (ui64)10);
+        UNIT_ASSERT(rr1 == EPopResult::Processed);
+        auto [p2, rr2] = PopOne(m);
+        UNIT_ASSERT_VALUES_EQUAL(p2->Cookie, (ui64)20);
+        UNIT_ASSERT(rr2 == EPopResult::Processed);
+        auto [p3, rr3] = PopOne(m);
+        UNIT_ASSERT_VALUES_EQUAL(p3->Cookie, (ui64)30);
+        UNIT_ASSERT(rr3 == EPopResult::Idle);
 
-        // Unlock and then transition to free
-        UNIT_ASSERT(m.TryUnlock());
+        // Push to idle mailbox returns Locked, Pop returns Idle for single event
+        {
+            std::unique_ptr<IEventHandle> lockEv = std::make_unique<IEventHandle>(
+                TActorId(), TActorId(), new TEvents::TEvPing, 0, 99);
+            UNIT_ASSERT(m.Push(lockEv) == EMailboxPush::Locked);
+            auto [popped, result] = PopOne(m);
+            UNIT_ASSERT(popped);
+            UNIT_ASSERT_VALUES_EQUAL(popped->Cookie, (ui64)99);
+            UNIT_ASSERT(result == EPopResult::Idle);
+        }
 
-        // TryLock should succeed on an idle mailbox
-        UNIT_ASSERT(m.TryLock());
-
-        // LockToFree drains remaining events
-        m.LockToFree();
-
-        std::unique_ptr<IEventHandle> ev4 = std::make_unique<IEventHandle>(TActorId(), TActorId(), new TEvents::TEvPing);
-        UNIT_ASSERT(m.Push(ev4) == EMailboxPush::Free);
-
-        // Mailbox is back in initial state
-        UNIT_ASSERT(m.IsFree());
         UNIT_ASSERT(m.IsEmpty());
     }
 
     Y_UNIT_TEST(FIFOOrder) {
         TMailbox m;
-        m.LockFromFree();
-        UNIT_ASSERT(m.TryUnlock());
 
         // Push multiple events to an idle mailbox
         constexpr size_t N = 10;
@@ -104,20 +109,29 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
 
         // Pop should return events in FIFO order
         for (size_t i = 0; i < N; ++i) {
-            auto ev = m.Pop();
+            auto [ev, result] = PopOne(m);
             UNIT_ASSERT(ev);
             UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
+            if (i < N - 1) {
+                UNIT_ASSERT(result == EPopResult::Processed);
+            } else {
+                UNIT_ASSERT(result == EPopResult::Idle);
+            }
         }
-        UNIT_ASSERT(!m.Pop());
-        UNIT_ASSERT(m.TryUnlock());
-
-        m.LockToFree();
     }
 
     Y_UNIT_TEST(SnapshotBudgetExhausted) {
         TMailbox m;
-        m.LockFromFree();
-        UNIT_ASSERT(m.TryUnlock());
+
+        // Push to idle mailbox and pop to get back to idle
+        {
+            std::unique_ptr<IEventHandle> ev = std::make_unique<IEventHandle>(
+                TActorId(), TActorId(), new TEvents::TEvPing, 0, 99);
+            UNIT_ASSERT(m.Push(ev) == EMailboxPush::Locked);
+            auto [popped, result] = PopOne(m);
+            UNIT_ASSERT(popped);
+            UNIT_ASSERT(result == EPopResult::Idle);
+        }
 
         // Push 5 events
         for (size_t i = 0; i < 5; ++i) {
@@ -138,21 +152,20 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
         }
         UNIT_ASSERT(result == ESnapshotResult::NeedsReschedule);
 
-        // Remaining events should be accessible via standalone Pop
-        for (size_t i = 3; i < 5; ++i) {
-            auto ev = m.Pop();
-            UNIT_ASSERT(ev);
-            UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
-        }
-        UNIT_ASSERT(!m.Pop());
-        UNIT_ASSERT(m.TryUnlock());
-        m.LockToFree();
+        // Remaining events should be accessible via template Pop
+        auto [ev3, r3] = PopOne(m);
+        UNIT_ASSERT(ev3);
+        UNIT_ASSERT_VALUES_EQUAL(ev3->Cookie, (ui64)3);
+        UNIT_ASSERT(r3 == EPopResult::Processed);
+
+        auto [ev4, r4] = PopOne(m);
+        UNIT_ASSERT(ev4);
+        UNIT_ASSERT_VALUES_EQUAL(ev4->Cookie, (ui64)4);
+        UNIT_ASSERT(r4 == EPopResult::Idle);
     }
 
     Y_UNIT_TEST(SnapshotIdle) {
         TMailbox m;
-        m.LockFromFree();
-        UNIT_ASSERT(m.TryUnlock());
 
         // Push 3 events to idle mailbox (first push returns Locked)
         for (size_t i = 0; i < 3; ++i) {
@@ -176,14 +189,10 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
 
         // Queue should be empty. TryUnlock succeeds (Tail/Head/Stub at stub/0).
         UNIT_ASSERT(m.TryUnlock());
-        m.TryLock();
-        m.LockToFree();
     }
 
     Y_UNIT_TEST(SnapshotNeedsReschedule) {
         TMailbox m;
-        m.LockFromFree();
-        UNIT_ASSERT(m.TryUnlock());
 
         // Push 3 events
         for (size_t i = 0; i < 3; ++i) {
@@ -221,43 +230,42 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
         }
         UNIT_ASSERT(result == ESnapshotResult::NeedsReschedule);
 
-        // Post-snapshot events are accessible via standalone Pop
-        for (size_t i = 3; i < 5; ++i) {
-            auto ev = m.Pop();
-            UNIT_ASSERT(ev);
-            UNIT_ASSERT_VALUES_EQUAL(ev->Cookie, i);
-        }
-        UNIT_ASSERT(!m.Pop());
-        UNIT_ASSERT(m.TryUnlock());
-        m.LockToFree();
+        // Post-snapshot events are accessible via template Pop
+        auto [ev3, r3] = PopOne(m);
+        UNIT_ASSERT(ev3);
+        UNIT_ASSERT_VALUES_EQUAL(ev3->Cookie, (ui64)3);
+        UNIT_ASSERT(r3 == EPopResult::Processed);
+
+        auto [ev4, r4] = PopOne(m);
+        UNIT_ASSERT(ev4);
+        UNIT_ASSERT_VALUES_EQUAL(ev4->Cookie, (ui64)4);
+        UNIT_ASSERT(r4 == EPopResult::Idle);
     }
 
     Y_UNIT_TEST(PushFront) {
         TMailbox m;
-        m.LockFromFree();
 
-        // Push event via normal Push (returns Pushed since State=Locked)
+        // Push ev1 to the idle mailbox (returns Locked)
         std::unique_ptr<IEventHandle> ev1 = std::make_unique<IEventHandle>(
             TActorId(), TActorId(), new TEvents::TEvPing, 0, 1);
-        UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Pushed);
+        UNIT_ASSERT(m.Push(ev1) == EMailboxPush::Locked);
+        UNIT_ASSERT(!ev1);
 
-        // PushFront should insert at the head
+        // PushFront should insert at the head (before ev1)
         std::unique_ptr<IEventHandle> ev0 = std::make_unique<IEventHandle>(
             TActorId(), TActorId(), new TEvents::TEvPing, 0, 0);
         m.PushFront(std::move(ev0));
 
         // Pop should return ev0 first, then ev1
-        auto popped = m.Pop();
-        UNIT_ASSERT(popped);
-        UNIT_ASSERT_VALUES_EQUAL(popped->Cookie, (ui64)0);
+        auto [popped0, r0] = PopOne(m);
+        UNIT_ASSERT(popped0);
+        UNIT_ASSERT_VALUES_EQUAL(popped0->Cookie, (ui64)0);
+        UNIT_ASSERT(r0 == EPopResult::Processed);
 
-        popped = m.Pop();
-        UNIT_ASSERT(popped);
-        UNIT_ASSERT_VALUES_EQUAL(popped->Cookie, (ui64)1);
-
-        UNIT_ASSERT(!m.Pop());
-        UNIT_ASSERT(m.TryUnlock());
-        m.LockToFree();
+        auto [popped1, r1] = PopOne(m);
+        UNIT_ASSERT(popped1);
+        UNIT_ASSERT_VALUES_EQUAL(popped1->Cookie, (ui64)1);
+        UNIT_ASSERT(r1 == EPopResult::Idle);
     }
 
     class TSimpleActor : public TActor<TSimpleActor> {
@@ -329,8 +337,6 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
         constexpr size_t nEvents = NSan::PlainOrUnderSanitizer(1000000, 100000);
 
         TMailbox mailbox;
-        mailbox.LockFromFree();
-        UNIT_ASSERT(mailbox.TryUnlock());
 
         std::atomic<size_t> eventIndex{ 0 };
         std::atomic<size_t> switches{ 0 };
@@ -365,32 +371,39 @@ Y_UNIT_TEST_SUITE(LockFreeMailbox) {
                             case EMailboxPush::Pushed:
                                 // This thread is still a producer
                                 break;
-                            case EMailboxPush::Free:
-                                // Cannot happen during this test
-                                Y_ABORT();
                         }
                     } else {
-                        // Work as a consumer
-                        auto ev = mailbox.Pop();
-                        if (!ev) {
+                        // Work as a consumer using template Pop.
+                        // Template Pop processes the event inside the callback
+                        // (single-consumer guarantee) and returns Idle when the
+                        // queue becomes empty — the consumer exits immediately,
+                        // no locked-empty window.
+                        auto consume = [&](IActor*, IEventHandle* ev) {
+                            TAutoPtr<IEventHandle> evAuto(ev);
+                            observed.push_back(ev->Cookie);
+                        };
+
+                        EPopResult popResult = mailbox.Pop(consume);
+                        if (popResult == EPopResult::Idle) {
+                            is_producer = true;
+                            continue;
+                        }
+                        if (popResult == EPopResult::Empty) {
                             if (mailbox.TryUnlock()) {
-                                // This thread is now a producer
                                 is_producer = true;
                                 continue;
                             }
-                            // We must have one more event — retry
-                            ev = mailbox.Pop();
-                            if (!ev) {
-                                // Incomplete push: producer linked Tail but
-                                // hasn't stored next yet. Spin briefly.
-                                for (int spin = 0; !ev && spin < 1000; ++spin) {
-                                    ev = mailbox.Pop();
-                                }
-                                Y_ABORT_UNLESS(ev, "Pop stuck after TryUnlock failure");
+                            // TryUnlock failed — events exist. Retry.
+                            for (int spin = 0; spin < 1000; ++spin) {
+                                popResult = mailbox.Pop(consume);
+                                if (popResult != EPopResult::Empty) break;
+                            }
+                            Y_ABORT_UNLESS(popResult != EPopResult::Empty, "Pop stuck after TryUnlock failure");
+                            if (popResult == EPopResult::Idle) {
+                                is_producer = true;
+                                continue;
                             }
                         }
-                        // Only one thread is supposed to be a consumer
-                        observed.push_back(ev->Cookie);
                     }
                 }
             });

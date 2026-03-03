@@ -297,7 +297,10 @@ Y_UNIT_TEST_SUITE(BasicExecutorPool) {
         UNIT_ASSERT_VALUES_EQUAL(stats[0].PoolActorRegistrations, 2);
         UNIT_ASSERT_VALUES_EQUAL(stats[0].PoolDestroyedActors, 0);
         UNIT_ASSERT_VALUES_EQUAL(stats[0].PoolAllocatedMailboxes, 4096); // one line
-        UNIT_ASSERT(stats[0].MailboxPushedOutByTime + stats[0].MailboxPushedOutByEventCount >= 2 * msgCount / TBasicExecutorPoolConfig::DEFAULT_EVENTS_PER_MAILBOX);
+        // Each load() sends msgCount self-messages. Last activation may drain
+        // the queue naturally (Idle) without hitting the event-count preemption,
+        // so subtract 1 per load (2 loads total) from the threshold.
+        UNIT_ASSERT(stats[0].MailboxPushedOutByTime + stats[0].MailboxPushedOutByEventCount >= 2 * msgCount / TBasicExecutorPoolConfig::DEFAULT_EVENTS_PER_MAILBOX - 2);
         UNIT_ASSERT_VALUES_EQUAL(stats[0].MailboxPushedOutBySoftPreemption, 0);
     }
 }
@@ -423,7 +426,9 @@ Y_UNIT_TEST_SUITE(ChangingThreadsCountInBasicExecutorPool) {
         const size_t threadsCounts[N] = { 1, 3, 2, 3, 1, 4 };
         for (ui32 idx = 0; idx < 4 * N; ++idx) {
             size_t currentThreadCount = threadsCounts[idx % N];
+            AtomicSet(ctx.State.ExpectedMaximum, 0);
             ctx.ExecutorPool->SetFullThreadCount(currentThreadCount);
+            Sleep(TDuration::MilliSeconds(10));
             AtomicSet(ctx.State.ExpectedMaximum, currentThreadCount);
 
             for (size_t testIdx = 0; testIdx < testCount; ++testIdx) {
@@ -431,7 +436,6 @@ Y_UNIT_TEST_SUITE(ChangingThreadsCountInBasicExecutorPool) {
                 Sleep(TDuration::MilliSeconds(100));
                 testActors.Stop();
             }
-            Sleep(TDuration::MilliSeconds(10));
         }
         ctx.ActorSystem->Stop();
     }

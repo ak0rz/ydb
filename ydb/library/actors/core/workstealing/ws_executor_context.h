@@ -53,16 +53,15 @@ namespace NActors::NWorkStealing {
         void ClearTLS();
 
         // Execute a single event from the mailbox.
-        // Returns true if an event was processed (more might remain).
-        // Returns false if no event was available (Pop() returned nullptr).
-        // Does NOT finalize the mailbox — caller must call FinishMailbox
-        // when ExecuteSingleEvent returns false.
-        // Writes the cycle counter (from GetCycleCountFast() already used
-        // for stats) to hpnowOut, so callers can reuse it.
-        bool ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnowOut);
+        // Returns EPopResult::Processed if an event was dispatched (more may exist).
+        // Returns EPopResult::Empty if no event was available.
+        // Returns EPopResult::Idle if an event was dispatched and the mailbox is now idle.
+        // Writes the cycle counter to hpnowOut so callers can reuse it.
+        EPopResult ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnowOut);
 
-        // Finalize the mailbox after the last ExecuteSingleEvent returns false.
+        // Finalize the mailbox after ExecuteSingleEvent returns Empty.
         // Unlocks or frees the mailbox as appropriate.
+        // Not needed when ExecuteSingleEvent returns Idle (mailbox already idle).
         void FinishMailbox(TMailbox* mailbox);
 
         void SetBucketMap(TBucketMap* bucketMap) { BucketMap_ = bucketMap; }
@@ -76,32 +75,47 @@ namespace NActors::NWorkStealing {
         // Called by EndBatch callback after each activation batch.
         void CommitLocalCursor();
 
-        // Result of a snapshot-based activation batch.
+        // Result of an activation batch.
         struct TActivationResult {
             ui32 EventsProcessed = 0;
+            bool IsIdle = false; // true if mailbox went idle (do NOT access mailbox after)
+            bool MailboxWasEmpty = false; // cached inside Pop callback before CAS
+            ui32 Hint = 0; // cached mailbox hint for safe post-Idle reclamation
         };
 
-        // Execute a mailbox activation batch using TMailboxSnapshot.
-        // Creates a snapshot of the mailbox queue and dispatches events until
-        // eventBudget, deadline, or queue exhaustion (whichever comes first).
-        // Does NOT finalize the mailbox — call FinalizeActivation after.
+        // Execute a mailbox activation batch. Dispatches events inside
+        // the Pop callback (before the deferred CAS) so there is never
+        // a window where two consumers touch the mailbox concurrently.
+        // Does NOT finalize the mailbox — call FinalizeActivation after
+        // (only when IsIdle is false).
         TActivationResult ExecuteActivation(
             TMailbox* mailbox,
             ui32 eventBudget,
             NHPTimer::STime deadline,
-            NHPTimer::STime& hpnow);
+            NHPTimer::STime& hpnow,
+            i16 slotIdx);
 
-        // Finalize a mailbox after an activation batch. Flushes accumulated
-        // stats, stamps slot affinity, and handles dead mailboxes (IsEmpty →
-        // LockToFree + hint reclamation). Tries TryUnlock for idle transition.
-        // Returns true if the mailbox is done (freed or went idle).
+        // Finalize a mailbox after an activation batch (non-Idle path only).
+        // Flushes accumulated stats, tries TryUnlock for idle transition,
+        // and reclaims empty+idle mailboxes.
+        // Slot affinity (LastPoolSlotIdx) is already stamped by ExecuteActivation.
+        // Returns true if the mailbox is done (reclaimed or went idle).
         // Returns false if the mailbox needs rescheduling (events remain).
-        bool FinalizeActivation(TMailbox* mailbox, i16 slotIdx, NHPTimer::STime hpnow);
+        bool FinalizeActivation(TMailbox* mailbox, NHPTimer::STime hpnow);
+
+        // Flush accumulated stats without touching the mailbox queue.
+        // Used when mailbox went idle inside Pop (CAS succeeded) and
+        // queue must not be accessed further.
+        void FlushStatsOnly(NHPTimer::STime hpnow);
+
+        // Free a hint back to the slot allocator.
+        void FreeHint(ui32 hint);
 
         // Do NOT start the thread.
         // TThread::Start() is never called.
     private:
-        void DispatchEvent(TMailbox* mailbox, std::unique_ptr<IEventHandle> ev, NHPTimer::STime& hpnow);
+        void DispatchEvent(TMailbox* mailbox, IEventHandle* ev, NHPTimer::STime& hpnow);
+        void DispatchEvent(TMailbox* mailbox, IActor* actor, IEventHandle* ev, NHPTimer::STime& hpnow);
         // Batch accumulator for per-event stats.
         // Eliminates atomic operations on the hot path by accumulating
         // stats in plain variables and flushing once per mailbox batch.

@@ -103,10 +103,14 @@ namespace NActors::NWorkStealing {
         Y_ABORT_UNLESS(segMem, "TWsMailboxTable: failed to allocate mailbox segment");
         auto* seg = static_cast<TMailbox*>(segMem);
 
-        // Placement-new each mailbox with correct hint
+        // Placement-new each mailbox with correct hint and initialized sentinels
         for (size_t i = 0; i < MailboxesPerSegment; ++i) {
             auto* mbox = new (&seg[i]) TMailbox();
             mbox->Hint = static_cast<ui32>((segIdx << SegmentShift) | i);
+            // Initialize Vyukov MPSC queue sentinels so every mailbox is always pushable
+            mbox->Head.store(mbox->StubPtr(), std::memory_order_relaxed);
+            mbox->Tail.store(reinterpret_cast<uintptr_t>(mbox->StubPtr()), std::memory_order_relaxed);
+            mbox->Stub.store(0, std::memory_order_relaxed);
         }
 
         // Allocate stats segment (2MB)

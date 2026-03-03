@@ -309,6 +309,35 @@ namespace NActors {
         {
         }
 
+        // Move constructor: creates a detached copy for the mailbox Pop
+        // last-event path. Transfers payload (Event, Buffer) and metadata
+        // (TraceId, OnNondeliveryHolder). Copies const/trivial fields.
+        // Sets NextLinkPtr to 0 — the detached copy is not in any queue.
+        // The moved-from original retains its NextLinkPtr (queue link).
+        IEventHandle(IEventHandle&& other) noexcept
+            : Type(other.Type)
+            , Flags(other.Flags)
+            , Recipient(other.Recipient)
+            , Sender(other.Sender)
+            , Cookie(other.Cookie)
+            , OriginScopeId(other.OriginScopeId)
+            , TraceId(std::move(other.TraceId))
+            , InterconnectSession(other.InterconnectSession)
+#ifdef ACTORSLIB_COLLECT_EXEC_STATS
+            , SendTime(other.SendTime)
+#endif
+            , Event(std::move(other.Event))
+            , Buffer(std::move(other.Buffer))
+            , RewriteRecipient(other.RewriteRecipient)
+            , RewriteType(other.RewriteType)
+            , OnNondeliveryHolder(std::move(other.OnNondeliveryHolder))
+        {
+            NextLinkPtr.store(0, std::memory_order_relaxed);
+#ifdef USE_ACTOR_CALLSTACK
+            Callstack = other.Callstack;
+#endif
+        }
+
         TIntrusivePtr<TEventSerializedData> GetChainBuffer();
         TIntrusivePtr<TEventSerializedData> ReleaseChainBuffer();
 

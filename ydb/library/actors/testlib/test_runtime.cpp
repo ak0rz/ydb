@@ -950,8 +950,6 @@ namespace NActors {
         // first step - find good enough mailbox
         TMailbox *mailbox = node->MailboxTable->Allocate();
 
-        mailbox->LockFromFree();
-
         const ui64 localActorId = AllocateLocalId();
         if (VERBOSE) {
             Cerr << "Register actor " << TypeName(*actor) << " as " << localActorId << ", mailbox: " << mailbox->Hint << "\n";
@@ -966,7 +964,7 @@ namespace NActors {
         RegistrationObserver(*this, parentId ? parentId : CurrentRecipient, actorId);
         DoActorInit(node->ActorSystem.Get(), actor, actorId, parentId ? parentId : CurrentRecipient);
 
-        // Note: test actorsystem mailboxes stay permanently locked
+        // Note: test actorsystem mailboxes are used only for actor lookup
 
         return actorId;
     }

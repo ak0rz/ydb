@@ -4,6 +4,7 @@
 #include "event.h"
 #include <library/cpp/containers/absl_flat_hash/flat_hash_map.h>
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 namespace NActors {
@@ -14,11 +15,16 @@ namespace NActors {
     enum class EMailboxPush {
         Locked,
         Pushed,
-        Free,
     };
 
     struct TMailboxStats {
         ui64 ElapsedCycles = 0;
+    };
+
+    enum class EPopResult : ui8 {
+        Empty,       // No event available (empty or incomplete push)
+        Processed,   // Event processed, more events may exist
+        Idle,        // Event processed, queue is now idle
     };
 
     enum class ESnapshotResult {
@@ -30,17 +36,6 @@ namespace NActors {
 
     class alignas(64) TMailbox {
         friend class TMailboxSnapshot;
-
-    public:
-        // Mailbox lifecycle state (visible to Push callers).
-        // Locked = consumer running, Push → Pushed.
-        // Idle = no consumer, first Push → Locked (caller schedules).
-        // Free = no actors, Push → Free (rejected).
-        enum class EState : ui8 {
-            Locked = 0,
-            Idle = 1,
-            Free = 2,
-        };
 
     private:
         enum class EActorPack : ui8 {
@@ -123,6 +118,13 @@ namespace NActors {
         void AttachAlias(ui64 localActorId, IActor* actor) noexcept;
         IActor* DetachAlias(ui64 localActorId) noexcept;
 
+        /**
+         * Looks up the actor for the event's recipient: tries FindActor
+         * first, then FindAlias (with Rewrite on hit). Returns null
+         * when no actor or alias matches (non-delivery case).
+         */
+        IActor* ResolveActor(IEventHandle* ev) noexcept;
+
         void EnableStats();
         void AddElapsedCycles(ui64);
         std::optional<ui64> GetElapsedCycles();
@@ -133,31 +135,47 @@ namespace NActors {
         bool Cleanup() noexcept;
         ~TMailbox() noexcept;
 
-        TMailbox() = default;
+        TMailbox() {
+            // Initialize Vyukov MPSC queue sentinels
+            Head.store(StubPtr(), std::memory_order_relaxed);
+            Tail.store(reinterpret_cast<uintptr_t>(StubPtr()), std::memory_order_relaxed);
+            Stub.store(0, std::memory_order_relaxed);
+        }
         TMailbox(const TMailbox&) = delete;
         TMailbox& operator=(const TMailbox&) = delete;
 
     public:
         /**
-         * Tries to push ev to the mailbox and returns the status. When it is
-         * EMailboxPush::Locked a previously idle mailbox becomes locked
-         * and needs to be scheduled for execution by the caller. When it is
-         * EMailboxPush::Pushed the event is added to the queue. When it is
-         * EMailboxPush::Free the mailbox is currently free (no actors)
-         * and the event cannot be delivered.
+         * Pushes ev to the mailbox. Returns EMailboxPush::Locked when the
+         * queue was idle (prev == StubPtr) — caller must schedule execution.
+         * Returns EMailboxPush::Pushed when events already existed.
          *
          * Vyukov MPSC queue: wait-free (single xchg + one release store).
+         * Exactly one Push per idle period gets StubPtr as prev (xchg
+         * atomicity), so exactly one caller schedules.
          */
         EMailboxPush Push(std::unique_ptr<IEventHandle>& ev) noexcept;
 
         /**
-         * Removes the next event from the mailbox. Returns nullptr when
-         * the queue is empty or the head event's next pointer is not yet
-         * visible (incomplete push). The mailbox stays locked.
+         * Pops and processes one event from the mailbox.
          *
-         * Standalone Pop handles the idle transition via CAS on Tail.
+         * Resolves the recipient actor: FindActor, then FindAlias
+         * with Rewrite if no direct actor is found. Calls
+         * process(actor, ev) where actor is null for non-delivery.
+         *
+         * The callback receives a non-owning IEventHandle*; the
+         * callback is responsible for wrapping it in TAutoPtr to
+         * manage lifetime.
+         *
+         * Callback signature:
+         *   void(IActor* actorOrNull, IEventHandle* ev)
+         *
+         * Returns EPopResult::Empty if no event was available,
+         * EPopResult::Processed if an event was processed and more may exist,
+         * EPopResult::Idle if the event was processed and the queue is now empty.
          */
-        std::unique_ptr<IEventHandle> Pop() noexcept;
+        template<typename F>
+        EPopResult Pop(F&& process) noexcept;
 
         /**
          * Counts the number of events for the given localActorId.
@@ -166,17 +184,10 @@ namespace NActors {
         std::pair<ui32, ui32> CountMailboxEvents(ui64 localActorId, ui32 maxTraverse) noexcept;
 
         /**
-         * Tries to lock an idle mailbox and returns true on success.
-         *
-         * Returns true only when Tail == StubPtr() (idle) and CAS succeeds.
-         */
-        bool TryLock() noexcept;
-
-        /**
-         * Tries to transition a locked empty mailbox to idle.
+         * Checks if the mailbox queue is empty (idle).
          *
          * Returns true only when Head is at stub, stub has no pending link,
-         * and Tail can be CAS'd back to StubPtr().
+         * and Tail is at StubPtr. Double-checks for Push races.
          */
         bool TryUnlock() noexcept;
 
@@ -186,29 +197,6 @@ namespace NActors {
          */
         void PushFront(std::unique_ptr<IEventHandle>&& ev) noexcept;
 
-        /**
-         * Returns true for free mailboxes
-         */
-        bool IsFree() const noexcept;
-
-        /**
-         * Transitions a locked mailbox to free state.
-         * Drains all remaining events for cleanup.
-         */
-        void LockToFree() noexcept;
-
-        /**
-         * Race-safe variant of LockToFree. Uses CAS on Tail, so it fails
-         * (returns false) if events arrived between the caller's check
-         * and this call. On failure the mailbox stays locked.
-         */
-        bool TryLockToFree() noexcept;
-
-        /**
-         * Transitions a free mailbox to locked state.
-         * Drains any orphan events pushed between LockToFree and now.
-         */
-        void LockFromFree() noexcept;
 
         /**
          * Tries to unlock and schedules for execution on failure
@@ -216,10 +204,9 @@ namespace NActors {
         void Unlock(IExecutorPool* pool, NHPTimer::STime now, ui64& revolvingCounter);
 
         /**
-         * Returns true when a free mailbox can be reclaimed
+         * Returns true when an empty mailbox can be reclaimed
          */
         bool CanReclaim() const noexcept {
-            Y_DEBUG_ABORT_UNLESS(IsFree());
             return Head.load(std::memory_order_relaxed) == StubPtr();
         }
 
@@ -231,6 +218,14 @@ namespace NActors {
         }
 
     private:
+        static IEventHandle* GetNextPtrAcquire(IEventHandle* ev) noexcept {
+            return reinterpret_cast<IEventHandle*>(ev->NextLinkPtr.load(std::memory_order_acquire));
+        }
+
+        static void SetNextPtr(IEventHandle* ev, IEventHandle* next) noexcept {
+            ev->NextLinkPtr.store(reinterpret_cast<uintptr_t>(next), std::memory_order_relaxed);
+        }
+
         void EnsureActorMap();
         void DrainAndDelete(uintptr_t tail) noexcept;
         void CleanupActor(IActor* actor) noexcept;
@@ -240,7 +235,10 @@ namespace NActors {
 
         EActorPack ActorPack = EActorPack::Empty;
 
-        std::atomic<EState> State{ EState::Free };
+        // Set by Pop when the last-event CAS(Tail, original, StubPtr) fails.
+        // The next Pop call skips (deletes) the already-processed head event
+        // instead of re-dispatching it. Avoids spinning on NextLinkPtr.
+        bool ProcessedHead_ = false;
 
         // Work-stealing: 1-based index of the last slot that executed this mailbox.
         // 0 means fresh/unassigned. Written by slot after execution (relaxed store).
@@ -270,29 +268,131 @@ namespace NActors {
 
     static_assert(sizeof(TMailbox) <= 64, "TMailbox is too large");
 
+    // ---- Template Pop implementation ----
+
     /**
-     * Lightweight snapshot of a mailbox for batch event processing.
+     * Pop dequeues one event, resolves the actor, and passes a non-owning
+     * raw pointer to the callback. The callback is responsible for
+     * wrapping it in TAutoPtr (or similar) to manage lifetime.
      *
-     * Stores a local cursor and a snapshotted tail boundary. Pop() returns
-     * events up to (and including) the snapshot tail. The destructor updates
-     * the mailbox Head and writes the caller-provided ESnapshotResult.
+     * For the last-event path, Pop creates a detached move-copy of the
+     * event and runs the callback on the copy while the original shell
+     * (with NextLinkPtr) stays in the queue. After the callback, CAS
+     * Tail(original, StubPtr) idles the queue. This eliminates the
+     * locked-empty window and removes the need for State.
      *
-     * Does NOT handle idle transition — that's done by standalone Pop()/TryUnlock().
+     * Callback signature:
+     *   void(IActor* actorOrNull, IEventHandle* ev)
+     */
+    template<typename F>
+    EPopResult TMailbox::Pop(F&& process) noexcept {
+        IEventHandle* head = Head.load(std::memory_order_relaxed);
+
+        // Skip a previously-processed last event from a prior CAS failure.
+        // The original shell is still at Head; advance past it once the
+        // producer's NextLinkPtr store becomes visible.
+        if (ProcessedHead_) {
+            IEventHandle* next = GetNextPtrAcquire(head);
+            if (!next) {
+                return EPopResult::Empty; // Push in progress; retry later
+            }
+            Head.store(next, std::memory_order_relaxed);
+            delete head;
+            ProcessedHead_ = false;
+            head = next;
+        }
+
+        if (head == StubPtr()) {
+            uintptr_t sn = Stub.load(std::memory_order_acquire);
+            if (!sn) {
+                return EPopResult::Empty;
+            }
+            head = reinterpret_cast<IEventHandle*>(sn);
+            Stub.store(0, std::memory_order_relaxed);
+            Head.store(head, std::memory_order_relaxed);
+        }
+
+        IEventHandle* result = head;
+        IEventHandle* next = GetNextPtrAcquire(result);
+
+        if (next) {
+            // Non-last event: detach and give ownership to callback.
+            Head.store(next, std::memory_order_relaxed);
+            SetNextPtr(result, nullptr);
+            IActor* actor = ResolveActor(result);
+            process(actor, result);
+            return EPopResult::Processed;
+        }
+
+        // Last event (or incomplete push). Resolve actor on the original
+        // (still in the queue), then create a detached copy for the
+        // callback. The original retains NextLinkPtr so Push can link
+        // to it safely during the callback.
+        IActor* actor = ResolveActor(result);
+        IEventHandle* copy = new IEventHandle(std::move(*result));
+        process(actor, copy);
+
+        // Speculatively set Head to StubPtr before the CAS. After a
+        // successful CAS the mailbox is idle — a new consumer may start
+        // immediately on another thread and must see Head == StubPtr.
+        Head.store(StubPtr(), std::memory_order_release);
+
+        // CAS Tail(original, StubPtr) to idle the queue.
+        uintptr_t expected = reinterpret_cast<uintptr_t>(result);
+        if (Tail.compare_exchange_strong(expected,
+                reinterpret_cast<uintptr_t>(StubPtr()),
+                std::memory_order_acq_rel)) {
+            // Queue is idle. Do NOT touch mailbox — new consumer may be active.
+            delete result;
+            return EPopResult::Idle;
+        }
+
+        // CAS failed — a concurrent Push changed Tail. The original shell
+        // stays alive (producer links to it via NextLinkPtr). Mark it as
+        // processed so the next Pop skips it instead of re-dispatching.
+        Head.store(result, std::memory_order_release);
+        ProcessedHead_ = true;
+        return EPopResult::Processed;
+    }
+
+    /**
+     * Lightweight wrapper for batch event processing.
+     *
+     * Each Pop() call delegates to TMailbox::Pop() (the template version),
+     * which handles the deferred CAS idle transition and ProcessedHead_.
+     * Result is updated after each successful Pop.
+     *
+     * Defaults to NeedsReschedule (safe fallback — causes TryUnlock).
+     * Only set to Idle when Pop's CAS proves the queue is idle.
      */
     class TMailboxSnapshot {
     public:
-        TMailboxSnapshot(TMailbox* mb, ESnapshotResult& result) noexcept;
-        ~TMailboxSnapshot() noexcept;
+        TMailboxSnapshot(TMailbox* mb, ESnapshotResult& result) noexcept
+            : Mailbox(mb), Result(result)
+        {
+            Result = ESnapshotResult::NeedsReschedule;
+        }
+
+        ~TMailboxSnapshot() noexcept = default;
 
         TMailboxSnapshot(const TMailboxSnapshot&) = delete;
         TMailboxSnapshot& operator=(const TMailboxSnapshot&) = delete;
 
-        std::unique_ptr<IEventHandle> Pop() noexcept;
+        std::unique_ptr<IEventHandle> Pop() noexcept {
+            IEventHandle* captured = nullptr;
+            EPopResult popResult = Mailbox->Pop([&](IActor*, IEventHandle* ev) {
+                captured = ev;
+            });
+            if (captured) {
+                Result = (popResult == EPopResult::Idle)
+                    ? ESnapshotResult::Idle
+                    : ESnapshotResult::NeedsReschedule;
+            }
+            return captured ? std::unique_ptr<IEventHandle>(captured) : nullptr;
+        }
 
     private:
         TMailbox* Mailbox;
-        IEventHandle* Cursor;
-        IEventHandle* SnapshotTail;
         ESnapshotResult& Result;
     };
 

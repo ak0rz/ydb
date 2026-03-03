@@ -50,23 +50,24 @@ namespace NActors::NWorkStealing {
         // Head is updated by Pop() directly (no false-sharing with Tail).
     }
 
-    void TWSExecutorContext::DispatchEvent(TMailbox* mailbox, std::unique_ptr<IEventHandle> ev, NHPTimer::STime& hpnow) {
+    void TWSExecutorContext::DispatchEvent(TMailbox* mailbox, IEventHandle* ev, NHPTimer::STime& hpnow) {
+        IActor* actor = mailbox->ResolveActor(ev);
+        DispatchEvent(mailbox, actor, ev, hpnow);
+    }
+
+    void TWSExecutorContext::DispatchEvent(TMailbox* mailbox, IActor* actor, IEventHandle* ev, NHPTimer::STime& hpnow) {
         NHPTimer::STime hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
         ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
 
         TActorId recipient = ev->GetRecipientRewrite();
-        IActor* actor = mailbox->FindActor(recipient.LocalId());
-        if (!actor) {
-            actor = mailbox->FindAlias(recipient.LocalId());
-            if (actor) {
-                ev->Rewrite(ev->GetTypeRewrite(), actor->SelfId());
-                recipient = ev->GetRecipientRewrite();
-            }
-        }
 
         TActorContext ctx(*mailbox, *this, hpnow, recipient);
         TlsActivationContext = &ctx;
-        TAutoPtr<IEventHandle> evAuto = ev.release();
+
+        // TAutoPtr wraps the event for Receive compatibility.
+        // If Receive (or ForwardOnNondelivery) takes ownership, evAuto becomes
+        // null and its destructor is a no-op. Otherwise evAuto destructor frees.
+        TAutoPtr<IEventHandle> evAuto(ev);
 
         if (actor) {
             ui32 activityType = actor->GetActivityType().GetIndex();
@@ -125,6 +126,13 @@ namespace NActors::NWorkStealing {
             }
 
             CurrentRecipient = TActorId();
+        } else if (Y_UNLIKELY(evAuto->GetTypeRewrite() == TEvents::TSystem::RegisterActor)) {
+            auto* reg = evAuto->CastAsLocal<TEvents::TEvRegisterActor>();
+            mailbox->AttachActor(reg->LocalActorId, reg->Actor);
+            reg->Actor = nullptr; // consumer took ownership
+            hpnow = GetCycleCountFast();
+            hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
+            ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
         } else {
             TAutoPtr<IEventHandle> nonDelivered = IEventHandle::ForwardOnNondelivery(std::move(evAuto), TEvents::TEvUndelivered::ReasonActorUnknown);
             if (nonDelivered.Get()) {
@@ -141,71 +149,81 @@ namespace NActors::NWorkStealing {
         NProfiling::TMemoryTagScope::Reset(0);
     }
 
-    bool TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
-        std::unique_ptr<IEventHandle> ev = mailbox->Pop();
-        if (!ev) {
-            return false;
-        }
-        DispatchEvent(mailbox, std::move(ev), hpnow);
-        if (mailbox->IsEmpty()) {
-            mailbox->LockToFree();
-        }
-        return true;
+    EPopResult TWSExecutorContext::ExecuteSingleEvent(TMailbox* mailbox, NHPTimer::STime& hpnow) {
+        return mailbox->Pop([&](IActor* actor, IEventHandle* ev) {
+            DispatchEvent(mailbox, actor, ev, hpnow);
+        });
     }
 
     TWSExecutorContext::TActivationResult TWSExecutorContext::ExecuteActivation(
-        TMailbox* mailbox, ui32 eventBudget, NHPTimer::STime deadline, NHPTimer::STime& hpnow)
+        TMailbox* mailbox, ui32 eventBudget, NHPTimer::STime deadline, NHPTimer::STime& hpnow,
+        i16 slotIdx)
     {
         TActivationResult result;
+        result.Hint = mailbox->Hint;
         NHPTimer::STime hpBefore = hpnow;
-        ESnapshotResult snapshotResult;
-        {
-            TMailboxSnapshot snapshot(mailbox, snapshotResult);
-            while (eventBudget > 0) {
-                auto ev = snapshot.Pop();
-                if (!ev) break;
-                DispatchEvent(mailbox, std::move(ev), hpnow);
-                --eventBudget;
-                ++result.EventsProcessed;
-                if (mailbox->IsEmpty()) break;
-                if (hpnow >= deadline) break;
+
+        // Stamp affinity before processing events. Must happen before
+        // Pop can CAS → Idle, since after Idle the mailbox must not be
+        // accessed. On the non-Idle path FinalizeActivation used to
+        // stamp this, but the Idle path skipped it — causing the
+        // receiver to bounce via PowerOfTwoHash during startup.
+        mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
+
+        // Dispatch events inside the Pop callback — before the deferred CAS.
+        // This guarantees exclusive consumer access during DispatchEvent.
+        // After Pop returns Idle, the mailbox must NOT be accessed (a new
+        // consumer may already be running on it).
+        while (eventBudget > 0) {
+            EPopResult popResult = mailbox->Pop([&](IActor* actor, IEventHandle* ev) {
+                DispatchEvent(mailbox, actor, ev, hpnow);
+                // Cache emptiness while we still hold exclusive access.
+                // After the CAS → Idle (which happens after this callback
+                // returns), reading mailbox fields is a data race.
+                result.MailboxWasEmpty = mailbox->IsEmpty();
+            });
+            if (popResult == EPopResult::Empty) break;
+            --eventBudget;
+            ++result.EventsProcessed;
+            if (popResult == EPopResult::Idle) {
+                result.IsIdle = true;
+                break;
             }
+            if (hpnow >= deadline) break;
         }
 
-        // Update bucket stats with total activation cost
+        // Update bucket stats with total activation cost.
+        // Uses cached hint (safe after Idle).
         if (BucketMap_ && result.EventsProcessed > 0) {
             uint64_t totalCycles = static_cast<uint64_t>(hpnow - hpBefore);
-            BucketMap_->UpdateAfterExecution(mailbox->Hint, totalCycles);
+            BucketMap_->UpdateAfterExecution(result.Hint, totalCycles);
         }
 
         return result;
     }
 
-    bool TWSExecutorContext::FinalizeActivation(TMailbox* mailbox, i16 slotIdx, NHPTimer::STime hpnow) {
+    bool TWSExecutorContext::FinalizeActivation(TMailbox* mailbox, NHPTimer::STime hpnow) {
         FlushAllStats(hpnow);
         TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
         TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
 
-        // Stamp affinity before any state transition — after unlock/free
-        // another thread may read LastPoolSlotIdx via RouteActivation.
-        mailbox->LastPoolSlotIdx = static_cast<ui16>(slotIdx + 1);
+        // LastPoolSlotIdx already stamped by ExecuteActivation (before
+        // any Pop can CAS → Idle). No need to re-stamp here.
 
-        if (mailbox->IsFree()) {
+        // Try to idle the mailbox. TryUnlock checks Head+Stub+Tail
+        // to ensure no push is in progress and the queue is truly idle.
+        bool isIdle = mailbox->TryUnlock();
+
+        // Reclaim empty+idle mailboxes (last actor called PassAway and
+        // queue is idle). Safe because TryUnlock succeeded — no concurrent
+        // consumer can start until a new Push arrives.
+        if (isIdle && mailbox->IsEmpty()) {
             if (SlotAllocator_) {
                 SlotAllocator_->Free(mailbox->Hint);
             }
-            return true;
         }
 
-        if (mailbox->IsEmpty()) {
-            mailbox->LockToFree();
-            if (SlotAllocator_) {
-                SlotAllocator_->Free(mailbox->Hint);
-            }
-            return true;
-        }
-
-        return mailbox->TryUnlock();
+        return isIdle;
     }
 
     void TWSExecutorContext::FlushClassStats() {
@@ -247,25 +265,25 @@ namespace NActors::NWorkStealing {
         Accum_.Reset();
     }
 
+    void TWSExecutorContext::FlushStatsOnly(NHPTimer::STime hpnow) {
+        FlushAllStats(hpnow);
+        TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
+        TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
+    }
+
+    void TWSExecutorContext::FreeHint(ui32 hint) {
+        if (SlotAllocator_) {
+            SlotAllocator_->Free(hint);
+        }
+    }
+
     void TWSExecutorContext::FinishMailbox(TMailbox* mailbox) {
         NHPTimer::STime hpnow = GetCycleCountFast();
         FlushAllStats(hpnow);
         TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
         TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
 
-        if (mailbox->IsFree()) {
-            // Mailbox was freed inside ExecuteSingleEvent (LockToFree after
-            // last actor PassAway'd). Return the hint to the allocator so
-            // it can be reused by future Register() calls.
-            if (SlotAllocator_) {
-                SlotAllocator_->Free(mailbox->Hint);
-            }
-            return;
-        }
-
         // Reclaim empty mailboxes (last actor called PassAway).
-        // TryLockToFree checks Head==StubPtr, Stub==0, and CAS on Tail,
-        // so it fails safely if a concurrent Push arrived.
         if (mailbox->IsEmpty() && mailbox->CanReclaim()) {
             if (SlotAllocator_) {
                 SlotAllocator_->Free(mailbox->Hint);

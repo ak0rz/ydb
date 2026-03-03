@@ -211,23 +211,20 @@ namespace NActors {
 
         ThreadCtx.ResetOverwrittenEventsPerMailbox();
         ThreadCtx.ResetOverwrittenTimePerMailboxTs();
+        EPopResult popResult = EPopResult::Empty;
         for (; execCtx.ExecutedEvents < ThreadCtx.OverwrittenEventsPerMailbox(); execCtx.ExecutedEvents++) {
-            if (std::unique_ptr<IEventHandle> evExt = mailbox->Pop()) {
+            popResult = mailbox->Pop([&](IActor* foundActor, IEventHandle* ev) {
                 EXECUTOR_THREAD_DEBUG(EDebugLevel::Event, "mailbox->Pop()");
-                recipient = evExt->GetRecipientRewrite();
-                actor = mailbox->FindActor(recipient.LocalId());
-                if (!actor) {
-                    actor = mailbox->FindAlias(recipient.LocalId());
-                    if (actor) {
-                        // Work as if some alias actor rewrites events and delivers them to the real actor id
-                        evExt->Rewrite(evExt->GetTypeRewrite(), actor->SelfId());
-                        recipient = evExt->GetRecipientRewrite();
-                    }
-                }
+                recipient = ev->GetRecipientRewrite();
+                actor = foundActor;
                 TActorContext ctx(*mailbox, *this, eventStart, recipient);
                 TlsActivationContext = &ctx; // ensure dtor (if any) is called within actor system
-                // move for destruct before ctx;
-                TAutoPtr<IEventHandle> ev = evExt.release();
+
+                // TAutoPtr wraps the raw pointer for Receive compatibility.
+                // If Receive (or ForwardOnNondelivery) takes ownership, evAuto becomes
+                // null and its destructor is a no-op. Otherwise evAuto destructor frees.
+                TAutoPtr<IEventHandle> evAuto(ev);
+
                 if (actor) {
                     EXECUTOR_THREAD_DEBUG(EDebugLevel::Event, "actor is not null");
                     wasWorking = true;
@@ -235,7 +232,7 @@ namespace NActors {
                     actorType = &typeid(*actor);
 
 #ifdef USE_ACTOR_CALLSTACK
-                    TCallstack::GetTlsCallstack() = ev->Callstack;
+                    TCallstack::GetTlsCallstack() = evAuto->Callstack;
                     TCallstack::GetTlsCallstack().SetLinesToSkip();
 #endif
                     CurrentRecipient = recipient;
@@ -249,13 +246,13 @@ namespace NActors {
                         firstEvent = false;
                     }
 
-                    i64 usecDeliv = ExecutionStats.AddEventDeliveryStats(ev->SendTime, hpprev);
+                    i64 usecDeliv = ExecutionStats.AddEventDeliveryStats(evAuto->SendTime, hpprev);
                     if (usecDeliv > 5000) {
                         double sinceActivationMs = NHPTimer::GetSeconds(hpprev - execCtx.HPStart) * 1000.0;
-                        LwTraceSlowDelivery(ev.Get(), actorType, ThreadCtx.PoolId(), CurrentRecipient, NHPTimer::GetSeconds(hpprev - ev->SendTime) * 1000.0, sinceActivationMs, execCtx.ExecutedEvents);
+                        LwTraceSlowDelivery(evAuto.Get(), actorType, ThreadCtx.PoolId(), CurrentRecipient, NHPTimer::GetSeconds(hpprev - evAuto->SendTime) * 1000.0, sinceActivationMs, execCtx.ExecutedEvents);
                     }
 
-                    ui32 evTypeForTracing = ev->Type;
+                    ui32 evTypeForTracing = evAuto->Type;
 
                     ui32 activityType = actor->GetActivityType().GetIndex();
                     if (activityType != prevActivityType) {
@@ -264,7 +261,7 @@ namespace NActors {
                         TlsThreadContext->ActivityContext.ElapsingActorActivity.store(activityType, std::memory_order_release);
                     }
 
-                    actor->Receive(ev);
+                    actor->Receive(evAuto);
 
                     hpnow = GetCycleCountFast();
                     hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
@@ -277,16 +274,11 @@ namespace NActors {
                         actor = nullptr;
                     }
 
-                    if (mailbox->IsEmpty()) {
-                        // had actors and became empty, prepare to reclaim mailbox
-                        mailbox->LockToFree();
-                    }
-
                     ExecutionStats.AddElapsedCycles(activityType, hpnow - hpprev);
                     NHPTimer::STime elapsed = ExecutionStats.AddEventProcessingStats(eventStart, hpnow, activityType, CurrentActorScheduledEventsCounter);
                     mailbox->AddElapsedCycles(elapsed);
                     if (elapsed > 1000000) {
-                        LwTraceSlowEvent(ev.Get(), evTypeForTracing, actorType, ThreadCtx.PoolId(), CurrentRecipient, NHPTimer::GetSeconds(elapsed) * 1000.0);
+                        LwTraceSlowEvent(evAuto.Get(), evTypeForTracing, actorType, ThreadCtx.PoolId(), CurrentRecipient, NHPTimer::GetSeconds(elapsed) * 1000.0);
                     }
 
                     // The actor might have been destroyed
@@ -294,11 +286,18 @@ namespace NActors {
                         actor->AddElapsedTicks(elapsed);
 
                     CurrentRecipient = TActorId();
+                } else if (Y_UNLIKELY(evAuto->GetTypeRewrite() == TEvents::TSystem::RegisterActor)) {
+                    auto* reg = evAuto->CastAsLocal<TEvents::TEvRegisterActor>();
+                    mailbox->AttachActor(reg->LocalActorId, reg->Actor);
+                    reg->Actor = nullptr; // consumer took ownership
+                    hpnow = GetCycleCountFast();
+                    hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
+                    ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
                 } else {
                     EXECUTOR_THREAD_DEBUG(EDebugLevel::Event, "actor is null");
                     actorType = nullptr;
 
-                    TAutoPtr<IEventHandle> nonDelivered = IEventHandle::ForwardOnNondelivery(std::move(ev), TEvents::TEvUndelivered::ReasonActorUnknown);
+                    TAutoPtr<IEventHandle> nonDelivered = IEventHandle::ForwardOnNondelivery(std::move(evAuto), TEvents::TEvUndelivered::ReasonActorUnknown);
                     if (nonDelivered.Get()) {
                         ActorSystem->Send(nonDelivered);
                     } else {
@@ -308,84 +307,101 @@ namespace NActors {
                     hpprev = TlsThreadContext->UpdateStartOfProcessingEventTS(hpnow);
                     ExecutionStats.AddElapsedCycles(ActorSystemIndex, hpnow - hpprev);
                 }
+
                 eventStart = hpnow;
+            });
 
-                if (TlsThreadContext->CheckCapturedSendingType(ESendingType::Tail)) {
-                    ExecutionStats.IncrementMailboxPushedOutByTailSending();
-                    LWTRACK(MailboxPushedOutByTailSending,
+            if (popResult != EPopResult::Processed) {
+                if (popResult == EPopResult::Empty) {
+                    if (execCtx.ExecutedEvents == 0)
+                        ExecutionStats.IncrementEmptyMailboxActivation();
+                    LWTRACK(MailboxEmpty,
                             ThreadCtx.ExecutionContext.Orbit,
                             ThreadCtx.PoolId(),
                             ThreadCtx.PoolName(),
-                            execCtx.ExecutedEvents + 1,
-                            CyclesToDuration(hpnow - execCtx.HPStart),
+                            execCtx.ExecutedEvents,
+                            CyclesToDuration(GetCycleCountFast() - execCtx.HPStart),
                             ThreadCtx.WorkerId(),
                             recipient.ToString(),
-                            SafeTypeName(actorType));
-                    preemptedByTailSend = true;
-                    break;
+                            SafeTypeName(actor));
                 }
+                break; // empty or idle queue, leave
+            }
 
-                // Soft preemption in united pool
-                if (ThreadCtx.SoftDeadlineTs() < (ui64)hpnow) {
-                    ExecutionStats.IncrementMailboxPushedOutBySoftPreemption();
-                    LWTRACK(MailboxPushedOutBySoftPreemption,
-                            ThreadCtx.ExecutionContext.Orbit,
-                            ThreadCtx.PoolId(),
-                            ThreadCtx.PoolName(),
-                            execCtx.ExecutedEvents + 1,
-                            CyclesToDuration(hpnow - execCtx.HPStart),
-                            ThreadCtx.WorkerId(),
-                            recipient.ToString(),
-                            SafeTypeName(actorType));
-                    preemptedByCycles = true;
-                    break;
-                }
-
-                // time limit inside one mailbox passed, let others do some work
-                if (hpnow - execCtx.HPStart > (i64)ThreadCtx.TimePerMailboxTs()) {
-                    ExecutionStats.IncrementMailboxPushedOutByTime();
-                    LWTRACK(MailboxPushedOutByTime,
-                            ThreadCtx.ExecutionContext.Orbit,
-                            ThreadCtx.PoolId(),
-                            ThreadCtx.PoolName(),
-                            execCtx.ExecutedEvents + 1,
-                            CyclesToDuration(hpnow - execCtx.HPStart),
-                            ThreadCtx.WorkerId(),
-                            recipient.ToString(),
-                            SafeTypeName(actorType));
-                    preemptedByCycles = true;
-                    break;
-                }
-
-                if (execCtx.ExecutedEvents + 1 == ThreadCtx.EventsPerMailbox()) {
-                    ExecutionStats.IncrementMailboxPushedOutByEventCount();
-                    LWTRACK(MailboxPushedOutByEventCount,
-                            ThreadCtx.ExecutionContext.Orbit,
-                            ThreadCtx.PoolId(),
-                            ThreadCtx.PoolName(),
-                            execCtx.ExecutedEvents + 1,
-                            CyclesToDuration(hpnow - execCtx.HPStart),
-                            ThreadCtx.WorkerId(),
-                            recipient.ToString(),
-                            SafeTypeName(actorType));
-                    preemptedByEventCount = true;
-                    break;
-                }
-            } else {
-                if (execCtx.ExecutedEvents == 0)
-                    ExecutionStats.IncrementEmptyMailboxActivation();
-                LWTRACK(MailboxEmpty,
+            // Preemption checks (only when more events may exist)
+            if (TlsThreadContext->CheckCapturedSendingType(ESendingType::Tail)) {
+                ExecutionStats.IncrementMailboxPushedOutByTailSending();
+                LWTRACK(MailboxPushedOutByTailSending,
                         ThreadCtx.ExecutionContext.Orbit,
                         ThreadCtx.PoolId(),
                         ThreadCtx.PoolName(),
-                        execCtx.ExecutedEvents,
-                        CyclesToDuration(GetCycleCountFast() - execCtx.HPStart),
+                        execCtx.ExecutedEvents + 1,
+                        CyclesToDuration(hpnow - execCtx.HPStart),
                         ThreadCtx.WorkerId(),
                         recipient.ToString(),
-                        SafeTypeName(actor));
-                break; // empty queue, leave
+                        SafeTypeName(actorType));
+                preemptedByTailSend = true;
+                break;
+            }
+
+            // Soft preemption in united pool
+            if (ThreadCtx.SoftDeadlineTs() < (ui64)hpnow) {
+                ExecutionStats.IncrementMailboxPushedOutBySoftPreemption();
+                LWTRACK(MailboxPushedOutBySoftPreemption,
+                        ThreadCtx.ExecutionContext.Orbit,
+                        ThreadCtx.PoolId(),
+                        ThreadCtx.PoolName(),
+                        execCtx.ExecutedEvents + 1,
+                        CyclesToDuration(hpnow - execCtx.HPStart),
+                        ThreadCtx.WorkerId(),
+                        recipient.ToString(),
+                        SafeTypeName(actorType));
+                preemptedByCycles = true;
+                break;
+            }
+
+            // time limit inside one mailbox passed, let others do some work
+            if (hpnow - execCtx.HPStart > (i64)ThreadCtx.TimePerMailboxTs()) {
+                ExecutionStats.IncrementMailboxPushedOutByTime();
+                LWTRACK(MailboxPushedOutByTime,
+                        ThreadCtx.ExecutionContext.Orbit,
+                        ThreadCtx.PoolId(),
+                        ThreadCtx.PoolName(),
+                        execCtx.ExecutedEvents + 1,
+                        CyclesToDuration(hpnow - execCtx.HPStart),
+                        ThreadCtx.WorkerId(),
+                        recipient.ToString(),
+                        SafeTypeName(actorType));
+                preemptedByCycles = true;
+                break;
+            }
+
+            if (execCtx.ExecutedEvents + 1 == ThreadCtx.EventsPerMailbox()) {
+                ExecutionStats.IncrementMailboxPushedOutByEventCount();
+                LWTRACK(MailboxPushedOutByEventCount,
+                        ThreadCtx.ExecutionContext.Orbit,
+                        ThreadCtx.PoolId(),
+                        ThreadCtx.PoolName(),
+                        execCtx.ExecutedEvents + 1,
+                        CyclesToDuration(hpnow - execCtx.HPStart),
+                        ThreadCtx.WorkerId(),
+                        recipient.ToString(),
+                        SafeTypeName(actorType));
+                preemptedByEventCount = true;
+                break;
             }
         }
+        if (popResult == EPopResult::Idle) {
+            // Mailbox already idle (Tail CASed to StubPtr inside Pop).
+            // Do not access mailbox further — a new consumer may start.
+            execCtx.PreemptionSubscribed.clear();
+            TlsThreadContext->ActivityContext.ActivationStartTS.store(hpnow, std::memory_order_release);
+            TlsThreadContext->ActivityContext.ElapsingActorActivity.store(ActorSystemIndex, std::memory_order_release);
+            NProfiling::TMemoryTagScope::Reset(0);
+            TlsActivationContext = nullptr;
+            return {false, wasWorking};
+        }
+
         if (execCtx.PreemptionSubscribed.size()) {
             std::unique_ptr<TEvents::TEvPreemption> event = std::make_unique<TEvents::TEvPreemption>();
             event->ByEventCount = preemptedByEventCount;
@@ -407,11 +423,9 @@ namespace NActors {
 
         NProfiling::TMemoryTagScope::Reset(0);
         TlsActivationContext = nullptr;
-        if (mailbox->IsEmpty() && mailbox->CanReclaim()) {
-            ThreadCtx.FreeMailbox(mailbox);
-        } else {
-            mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);
-        }
+        // Dead mailboxes (IsEmpty) stay in the Idle cycle. Stale events
+        // get non-delivered. Reclamation happens at shutdown via Cleanup().
+        mailbox->Unlock(ThreadCtx.Pool(), hpnow, RevolvingWriteCounter);
         return {preemptedByEventCount || preemptedByCycles, wasWorking};
     }
 

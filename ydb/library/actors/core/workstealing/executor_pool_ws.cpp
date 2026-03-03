@@ -4,6 +4,7 @@
 #include <ydb/library/actors/core/actor.h>
 #include <ydb/library/actors/core/actor_class_stats.h>
 #include <ydb/library/actors/core/actorsystem.h>
+#include <ydb/library/actors/core/events.h>
 #include <ydb/library/actors/core/mailbox_lockfree.h>
 #include <ydb/library/actors/core/probes.h>
 #include <ydb/library/actors/util/datetime.h>
@@ -231,11 +232,6 @@ namespace NActors::NWorkStealing {
                     mailbox->ScheduleMoment = GetCycleCountFast();
                     ScheduleActivation(mailbox);
                     return true;
-                case EMailboxPush::Free:
-                    Y_DEBUG_ABORT("WS Send: Push returned Free for hint=%" PRIu32 " recipient=%s",
-                        ev->GetRecipientRewrite().Hint(),
-                        ev->GetRecipientRewrite().ToString().c_str());
-                    break;
             }
         }
 
@@ -259,11 +255,6 @@ namespace NActors::NWorkStealing {
                     mailbox->ScheduleMoment = GetCycleCountFast();
                     SpecificScheduleActivation(mailbox);
                     return true;
-                case EMailboxPush::Free:
-                    Y_DEBUG_ABORT("WS SpecificSend: Push returned Free for hint=%" PRIu32 " recipient=%s",
-                        ev->GetRecipientRewrite().Hint(),
-                        ev->GetRecipientRewrite().ToString().c_str());
-                    break;
             }
         }
 
@@ -295,7 +286,6 @@ namespace NActors::NWorkStealing {
 
         TMailbox* mailbox = WsMailboxTable_->Get(hint);
         Y_ABORT_UNLESS(mailbox);
-        mailbox->LockFromFree();
 
         // Stamp initial execution end time so the first event's idle time
         // is measured from allocation
@@ -304,19 +294,30 @@ namespace NActors::NWorkStealing {
         }
 
         const ui64 localActorId = AllocateID();
-        mailbox->AttachActor(localActorId, actor);
-
         const TActorId actorId(ActorSystem->NodeId, PoolId, localActorId, mailbox->Hint);
+
+        // Push deferred registration event
+        auto* regEvent = new TEvents::TEvRegisterActor();
+        regEvent->Actor = actor;
+        regEvent->LocalActorId = localActorId;
+        regEvent->ParentId = parentId;
+        auto ev = std::make_unique<IEventHandle>(actorId, TActorId(), regEvent);
+        EMailboxPush pushResult = mailbox->Push(ev);
+        if (pushResult == EMailboxPush::Locked) {
+            // Normal case: mailbox was Idle, we locked it — schedule for execution
+            mailbox->ScheduleMoment = GetCycleCountFast();
+            ScheduleActivationEx(mailbox, ++revolvingWriteCounter);
+        }
+        // Pushed: a stale push already locked/scheduled this recycled mailbox.
+        // The consumer will process stale events (non-delivery) then our
+        // TEvRegisterActor which attaches the actor.
+
+        // Eager init on registering thread - sets SelfActorId, CreatedAtCycles_, ClassStats_ and calls Registered() on the actor.
+        // This is needed to ensure that the actor is fully initialized and registered before any other producer can send messages
+        // to it (e.g. from the parent during bootstrap).
         DoActorInit(ActorSystem, actor, actorId, parentId);
 
-        // Stuck actor monitoring is handled by TExecutorPoolBaseMailboxed
-        // (accesses IActor::StuckIndex via friend declaration).
-        // WS Register bypasses that; monitoring uses standard counters.
-
-        // Once we unlock the mailbox the actor starts running
         actor = nullptr;
-
-        mailbox->Unlock(this, GetCycleCountFast(), revolvingWriteCounter);
 
         NHPTimer::STime elapsed = GetCycleCountFast() - hpstart;
         (void)elapsed;
