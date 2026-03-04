@@ -73,6 +73,7 @@ message TActorSystemConfig {
         enum EType {
             BASIC = 1;
             IO = 2;
+            WORK_STEALING = 3;
         };
 
         optional EType Type = 1;

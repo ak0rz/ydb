@@ -135,6 +135,7 @@ PEERDIR(
     ydb/core/ymq/actor
     ydb/core/ymq/http
     ydb/library/actors/core
+    ydb/library/actors/core/workstealing
     ydb/library/actors/dnsresolver
     ydb/library/actors/interconnect
     ydb/library/actors/memory_log

@@ -4,6 +4,7 @@
 #include <ydb/core/protos/bootstrap.pb.h>
 #include <ydb/core/protos/resource_broker.pb.h>
 
+#include <ydb/library/actors/core/workstealing/ws_config.h>
 #include <ydb/library/actors/util/affinity.h>
 
 
@@ -114,6 +115,32 @@ void AddExecutorPool(NActors::TCpuManagerConfig& cpuManager, const NKikimrConfig
             io.Affinity = ParseAffinity(poolConfig.GetAffinity());
             cpuManager.IO.emplace_back(std::move(io));
             io.UseRingQueue = systemConfig.HasUseRingQueue() && systemConfig.GetUseRingQueue();
+            break;
+        }
+
+        case NKikimrConfig::TActorSystemConfig::TExecutor::WORK_STEALING: {
+            NActors::TWorkStealingPoolConfig ws;
+            ws.PoolId = poolId;
+            ws.PoolName = poolConfig.GetName();
+            ws.DefaultSlotCount = poolConfig.GetThreads();
+            ws.MinSlotCount = poolConfig.GetMinThreads();
+            ws.MaxSlotCount = poolConfig.GetMaxThreads();
+            if (poolConfig.HasTimePerMailboxMicroSecs()) {
+                ws.TimePerMailbox = TDuration::MicroSeconds(poolConfig.GetTimePerMailboxMicroSecs());
+            } else if (systemConfig.HasTimePerMailboxMicroSecs()) {
+                ws.TimePerMailbox = TDuration::MicroSeconds(systemConfig.GetTimePerMailboxMicroSecs());
+            }
+            if (poolConfig.HasEventsPerMailbox()) {
+                ws.EventsPerMailbox = poolConfig.GetEventsPerMailbox();
+            } else if (systemConfig.HasEventsPerMailbox()) {
+                ws.EventsPerMailbox = systemConfig.GetEventsPerMailbox();
+            }
+            ws.Priority = poolConfig.GetPriority();
+            if (!cpuManager.WorkStealing) {
+                cpuManager.WorkStealing.emplace();
+            }
+            cpuManager.WorkStealing->Enabled = true;
+            cpuManager.WorkStealing->Pools.emplace_back(std::move(ws));
             break;
         }
 
