@@ -31,11 +31,11 @@
       },
       {
           "name": "CFLAGS",
-          "value": "-mcpu=neoverse-v2 -fno-omit-frame-pointer"
+          "value": "-fno-omit-frame-pointer"
       }
     ],
     "target-platforms": [
-      "default-linux-aarch64"
+      "default-linux-aarch64_grace"
     ]
   },
   "data": [

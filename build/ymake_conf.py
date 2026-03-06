@@ -102,7 +102,7 @@ class Platform(object):
 
         self.is_armv6 = self.arch in ('armv6hf',)
         self.is_armv7 = self.arch in ('armv7', 'armv7a', 'armv7ahf', 'armv7a_neon', 'arm', 'armv7a_cortex_a9', 'armv7ahf_cortex_a35', 'armv7ahf_cortex_a53')
-        self.is_armv8 = self.arch in ('armv8', 'armv8a', 'arm64', 'aarch64', 'armv8a_cortex_a35', 'armv8a_cortex_a53')
+        self.is_armv8 = self.arch in ('armv8', 'armv8a', 'arm64', 'aarch64', 'armv8a_cortex_a35', 'armv8a_cortex_a53', 'aarch64_grace')
         self.is_armv8m = self.arch in ('armv8m_cortex_m33', 'armv8m_cortex_m23')
         self.is_armv7em = self.arch in ('armv7em_cortex_m4', 'armv7em_cortex_m7')
         self.is_arm64 = self.arch in ('arm64',)
@@ -145,6 +145,8 @@ class Platform(object):
         self.is_cortex_m4 = self.arch in ('armv7em_cortex_m4',)
         self.is_cortex_m7 = self.arch in ('armv7em_cortex_m7')
         self.is_arm968e_s = self.arch in ('armv5te_arm968e_s')
+
+        self.is_grace = self.arch in ('aarch64_grace',)
 
         self.is_power8le = self.arch == 'ppc64le'
         self.is_power9le = self.arch == 'power9le'
@@ -1275,6 +1277,9 @@ class GnuToolchain(Toolchain):
         elif target.is_cortex_a53:
             self.c_flags_platform.append('-mcpu=cortex-a53')
 
+        elif target.is_grace:
+            self.c_flags_platform.append('-mcpu=neoverse-v2')
+
         elif target.is_cortex_m4:
             self.c_flags_platform.append('-mcpu=cortex-m4 -mfpu=fpv4-sp-d16')
 
@@ -1318,7 +1323,7 @@ class GnuToolchain(Toolchain):
             target_flags = select(default=[], selectors=[
                 (target.is_linux and target.is_power8le, ['-mcpu=power8', '-mtune=power8', '-maltivec']),
                 (target.is_linux and target.is_power9le, ['-mcpu=power9', '-mtune=power9', '-maltivec']),
-                (target.is_linux and target.is_armv8, ['-march=armv8a']),
+                (target.is_linux and target.is_armv8 and not target.is_grace, ['-march=armv8a']),
                 (target.is_macos, ['-mmacosx-version-min={}'.format(MACOS_VERSION_MIN)]),
                 (target.is_ios and not target.is_iossim, ['-mios-version-min={}'.format(IOS_VERSION_MIN)]),
                 (target.is_iossim, ['-mios-simulator-version-min={}'.format(IOS_VERSION_MIN)]),
