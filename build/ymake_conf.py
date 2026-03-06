@@ -1278,7 +1278,7 @@ class GnuToolchain(Toolchain):
             self.c_flags_platform.append('-mcpu=cortex-a53')
 
         elif target.is_grace:
-            self.c_flags_platform.append('-mcpu=neoverse-v2')
+            self.c_flags_platform.append('-mcpu=neoverse-v2+norng+sve2-sm4+sve2-aes+sve2-sha3+fpac')
 
         elif target.is_cortex_m4:
             self.c_flags_platform.append('-mcpu=cortex-m4 -mfpu=fpv4-sp-d16')
