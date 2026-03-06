@@ -31,7 +31,7 @@
       },
       {
           "name": "CFLAGS",
-          "value": "-fno-omit-frame-pointer"
+          "value": "-mcpu=neoverse-v2 -fno-omit-frame-pointer"
       }
     ],
     "target-platforms": [
